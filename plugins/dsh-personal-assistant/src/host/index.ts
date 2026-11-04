@@ -23,7 +23,7 @@ export async function apply(ctx:PluginContext,config:PluginConfig){
  const handler=async(method:string,payload:any)=>{
   switch(method){
    case'command':{const result=await service.command(payload.command,payload.payload,{kind:'ui'},payload.requestId);if(payload.command==='settingsSave')await scheduler.reconfigure();return result;}
-   case'memory.manual':{const sourceId='manual:'+crypto.randomUUID();const {title,body,type,projectId,...extra}=payload;await service.storage.call('source',{id:sourceId,sessionId:'manual',role:'user',text:body});return service.command('memoryCapture',{title,body,type,projectId,notes:extra.notes??'',domains:extra.domains??[],importance:extra.importance??3,pinned:extra.pinned??false,reusable:extra.reusable??false,facts:[{subject:title,predicate:'内容',value:body}],sourceId,quote:body,occurredAt:new Date().toISOString()},{kind:'ui'});}
+   case'memory.manual':{const sourceId='manual:'+crypto.randomUUID();const {title,body,type,projectId,...extra}=payload;await service.storage.call('source',{id:sourceId,sessionId:'manual',role:'user' as const,text:body});return service.command('memoryCapture',{title,body,type,projectId,notes:extra.notes??'',domains:extra.domains??[],importance:extra.importance??3,pinned:extra.pinned??false,reusable:extra.reusable??false,facts:[{subject:title,predicate:'内容',value:body}],sourceId,quote:body,occurredAt:new Date().toISOString()},{kind:'ui'});}
    case'task.run':return service.run(payload);
    case'runs':return service.storage.call('runList');
    case'maintenance.run':await service.storage.call('jobScheduleNow',{id:'memory-daily'});return{scheduled:true};

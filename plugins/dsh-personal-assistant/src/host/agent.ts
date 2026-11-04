@@ -1,6 +1,7 @@
 import {defineTool} from '@deepseek-ai/dsh-tools';
 import {z} from 'zod';
 import {schemas,type Command} from '../domain/contracts.js';
+import type {PluginContext} from './context.js';
 export const name='personal-assistant-agent';
 export const inject=['personalAssistant','tools','systemPrompt'];
 const persona=`你可以使用用户的共享长期记忆与个人管理能力。保持当前工作区的助手角色、任务目标、工具、工作目录及权限。用户提出个人管理需求时，使用工具真正创建、修改和维护项目、记忆、任务、日程与工作流。
@@ -29,7 +30,7 @@ function spec(schema:any):any {
  if(schema.type==='array')return{type:'array',items:spec(schema.items??{})};
  return{type:schema.type,...description?{description}:{},...schema.enum?{enum:schema.enum}:{},...schema.const!==undefined?{const:schema.const}:{}};
 }
-export function apply(ctx:any,config:any={}){
+export function apply(ctx:PluginContext,config:{reviewOnly?:boolean}={}){
  const workflowTokens=new Set<symbol>();
  ctx.on('tools/execute',async(exec:any,next:any)=>{if(ctx.personalAssistant.isReport(exec.agent))throw new Error('REPORT_IS_READ_ONLY');const run=ctx.personalAssistant.workflowRuns.get(exec.agent?.id);if(!run)return next();if(workflowTokens.has(exec.parent))return next();if(exec.name==='run_code')return next();if(exec.name==='assistant_executeWorkflow'&&exec.arguments?.id===run.id&&exec.arguments?.version===run.version)return next();throw new Error('WORKFLOW_STEP_NOT_AUTHORIZED');});
  if(config.reviewOnly)ctx.on('tools/execute',async(exec:any,next:any)=>{if(!exec.name?.startsWith('assistant_'))throw new Error('MAINTENANCE_TOOL_NOT_ALLOWED');return next();});

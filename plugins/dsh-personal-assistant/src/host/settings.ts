@@ -1,5 +1,6 @@
 import {join} from 'node:path';
-export async function settingsOptions(ctx:any,root:string){
+import type {PluginContext} from './context.js';
+export async function settingsOptions(ctx:PluginContext,root:string){
  const selection=ctx.agentDefaultModel.currentSelection(),presets=(await ctx.agentPresets.list()).filter((p:any)=>!['personal-assistant','personal-assistant-maintenance'].includes(p.id));
  const catalogs=await Promise.allSettled(ctx.llm.listProviders().map(async(p:any)=>(await ctx.llm.listModels(p.id)).map((m:any)=>({id:p.id+'/'+m.id,name:(p.name??p.id)+' · '+m.name}))));
  const models=catalogs.flatMap(r=>r.status==='fulfilled'?r.value:[]),defaultModel=selection?.provider&&selection?.model?selection.provider+'/'+selection.model:'';

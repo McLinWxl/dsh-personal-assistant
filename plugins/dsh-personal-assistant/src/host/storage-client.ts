@@ -1,5 +1,6 @@
 import {Worker} from 'node:worker_threads';
 import {randomUUID} from 'node:crypto';
+import type {StorageMethods} from './storage-types.js';
 export class StorageClient {
   private worker:Worker;
   private pending=new Map<string,{resolve:(v:any)=>void;reject:(e:Error)=>void;timer:ReturnType<typeof setTimeout>}>();
@@ -12,6 +13,9 @@ export class StorageClient {
     this.worker.on('error',error=>this.fail(error));this.worker.on('exit',code=>{this.closed=true;this.fail(new Error('STORAGE_WORKER_EXITED_'+code));});
   }
   private fail(error:Error){for(const item of this.pending.values()){clearTimeout(item.timer);item.reject(error);}this.pending.clear();}
-  async call(method:string,args:any={}){await this.ready;if(this.closed)throw new Error('STORAGE_CLOSED');return new Promise<any>((resolve,reject)=>{const id=randomUUID();const timer=setTimeout(()=>{this.pending.delete(id);reject(new Error('STORAGE_OPERATION_TIMEOUT_CHECK_STATE'));},method==='export'?600000:120000);this.pending.set(id,{resolve,reject,timer});this.worker.postMessage({id,method,args});});}
+  /** Typed RPC: methods declared in StorageMethods are checked, the rest stay `any`. */
+  call<M extends keyof StorageMethods>(method:M,args?:StorageMethods[M]['args']):Promise<StorageMethods[M]['result']>;
+  call(method:string,args?:any):Promise<any>;
+  async call(method:string,args:any={}):Promise<any>{await this.ready;if(this.closed)throw new Error('STORAGE_CLOSED');return new Promise<any>((resolve,reject)=>{const id=randomUUID();const timer=setTimeout(()=>{this.pending.delete(id);reject(new Error('STORAGE_OPERATION_TIMEOUT_CHECK_STATE'));},method==='export'?600000:120000);this.pending.set(id,{resolve,reject,timer});this.worker.postMessage({id,method,args});});}
   async close(){if(this.closed)return;await this.call('close');this.closed=true;await this.worker.terminate();}
 }

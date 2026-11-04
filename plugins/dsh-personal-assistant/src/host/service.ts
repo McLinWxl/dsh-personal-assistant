@@ -11,6 +11,8 @@ import {inside} from '../storage/files.js';
 import {StorageClient} from './storage-client.js';
 import {type Actor} from '../domain/contracts.js';
 import {ProjectLifecycle} from './project-lifecycle.js';
+import type {PluginContext,AgentHandle,OwnerSession,SessionEvent} from './context.js';
+import type {AssistantSettings,PendingSource,SourceRecord,MemoryHit,RecordPage,RunRow,JobRow,ToolRecord,MaintenanceCommand,ChangeDetails,ConversationRow,ConversationMessage,ProjectRef} from './storage-types.js';
 export const PRESET='personal-assistant',REVIEW_PRESET='personal-assistant-maintenance';
 import {messageText,sourceFromEvent,isOwnerSession,isUserMessage,isReportTurn,REPORT_SOURCE} from './session-events.js';
 export class AssistantService {
@@ -30,7 +32,7 @@ export class AssistantService {
  private maintenanceSources=new Map<string,string>();
  private closed=false;private shutdown=new AbortController();
  private directoryBusy=false;private admissions=0;
- constructor(public ctx:any,public root:string,private onRootChanged:(root:string)=>Promise<void>){this.storage=new StorageClient(root);}
+ constructor(public ctx:PluginContext,public root:string,private onRootChanged:(root:string)=>Promise<void>){this.storage=new StorageClient(root);}
  async start(){await this.storage.ready;await this.storage.call('runRecover');this.disposers.push(this.ctx.on('session/event',(session:any,event:any)=>{
   if(this.closed||!isOwnerSession(session)||isReportTurn(session))return;
   const source=sourceFromEvent(session,event),storage=this.storage;
@@ -61,15 +63,15 @@ export class AssistantService {
   this.presetDisposers.push(await this.ctx.agentPresets.register({id:REVIEW_PRESET,name:'助手维护',order:100,plugins:[]}));
   for(const id of [PRESET,REVIEW_PRESET]){const preset=await this.ctx.agentPresets.resolve(id);if(preset.broken)throw new Error(preset.broken);}
  }
- async currentSource(agent:any){
+ async currentSource(agent:AgentHandle){
   const sourceOverride=this.maintenanceSources.get(agent.id);if(sourceOverride)return{id:sourceOverride};
   if(!isOwnerSession(agent.session)||isReportTurn(agent.session)||agent.session.header.agentPreset===REVIEW_PRESET)return null;
   const events=agent.session.snapshotEvents?.()??agent.session.events??[];
-  const event=[...events].reverse().find((e:any)=>isUserMessage(e));const message=event?.data.message??event?.data;
+  const event=[...events].reverse().find((e:SessionEvent)=>isUserMessage(e));const message=event?.data.message??event?.data;
   if(!message?.id)return null;const text=messageText(message);const id=agent.id+':'+message.id;
-  await this.storage.call('source',sourceFromEvent(agent.session,event));return{id,text};
+  const stored=event&&sourceFromEvent(agent.session,event);if(stored)await this.storage.call('source',stored);return{id,text};
  }
- async turnSources(agent:any){const events=agent.session.snapshotEvents();const begin=events.findLastIndex((e:any)=>isUserMessage(e));const sources:any[]=[];for(const event of events.slice(Math.max(0,begin))){if(!['tool/result','assistant/message'].includes(event.type))continue;const message=event.data.message,text=messageText(message);if(!message?.id||!text)continue;const source={id:agent.id+':'+message.id,sessionId:agent.id,role:event.type==='tool/result'?'tool':'assistant',text:text.slice(0,200000),status:'ordinary'};await this.storage.call('source',source);sources.push({id:source.id,role:source.role,text:source.text.slice(0,5000)});}return sources.slice(-6);}
+ async turnSources(agent:AgentHandle){const events=agent.session.snapshotEvents();const begin=events.findLastIndex((e:SessionEvent)=>isUserMessage(e));const sources:{id:string;role:string;text:string}[]=[];for(const event of events.slice(Math.max(0,begin))){if(!['tool/result','assistant/message'].includes(event.type))continue;const message=event.data.message,text=messageText(message);if(!message?.id||!text)continue;const source:SourceRecord={id:agent.id+':'+message.id,sessionId:agent.id,role:event.type==='tool/result'?'tool':'assistant',text:text.slice(0,200000),status:'ordinary'};await this.storage.call('source',source);sources.push({id:source.id,role:source.role,text:source.text.slice(0,5000)});}return sources.slice(-6);}
  async prepareContext(agent:any,reviewOnly:boolean){
   const source=await this.currentSource(agent);const settings=await this.command('settingsGet',{});
   let hits:any[]=[];if(!reviewOnly&&source?.text?.trim())hits=await this.command('memorySearch',{query:source.text.slice(0,1000),limit:12,purpose:'personal'},{kind:'system'});
@@ -96,14 +98,14 @@ export class AssistantService {
   if(!task&&!tool)throw new Error('TASK_OR_TOOL_REQUIRED');const run=await this.storage.call('runCreate',{requestId:a.requestId??randomUUID(),taskId:a.taskId,workflowVersion:tool?.version});
   if(this.active.has(run.id)||(await this.storage.call('runGet',{id:run.id})).status!=='queued')return run;
   const execute=async()=>{try{
-   const session=await this.createConversation(task?.data.title??tool.definition.title);if(tool?.definition.kind==='workflow')this.workflowRuns.set(session.sessionId,{id:tool.id,version:tool.version});await this.storage.call('runUpdate',{id:run.id,status:'running',sessionId:session.sessionId});
+   const session=await this.createConversation(task?.data.title??tool?.definition.title);if(tool?.definition.kind==='workflow')this.workflowRuns.set(session.sessionId,{id:tool.id,version:tool.version});await this.storage.call('runUpdate',{id:run.id,status:'running',sessionId:session.sessionId});
    const prompt=[tool?.definition.kind==='workflow'?'只执行指定工作流一次。不得处理查询结果中的任务，不执行任何额外业务操作。':'用户现在已点击执行此任务。现在完成下列任务的实际目标；任务记录中的待办、先不执行等历史状态不代表本轮的新指令。不重复创建任务，无需自行修改任务状态；插件会保存本次结果供用户核对。操作遵循宿主权限，核实实际成果后报告；遇到失败明确说明。只有可长期复用的结果才提炼记忆，不把一次运行的猜测当成通用事实。',task?JSON.stringify(task.data):'',tool?'使用此固定版本工具：'+JSON.stringify(tool)+(tool.definition.kind==='workflow'?' 必须调用 assistant_executeWorkflow 一次执行这个 id 和 version，不改写步骤。':' 先通过宿主工具检查脚本语法，再执行；不修改固定版本源码。'):''].join('\n');
    const result=await this.runTurn(session.sessionId,prompt,'run:'+run.id,600000);
    if(tool?.definition.kind==='workflow'&&(await this.storage.call('workflowResult',{sessionId:session.sessionId,toolId:tool.id,version:tool.version}))?.outcome!=='succeeded')throw new Error('WORKFLOW_EXECUTION_NOT_VERIFIED');let summary=result.text;if(tool?.definition.kind==='workflow'){summary=tool.definition.title+' · 已完成';try{const data=JSON.parse(result.text);for(const step of data.results??[]){const items=step.value?.items;if(Array.isArray(items))summary+='\n'+items.slice(0,30).map((r:any)=>r.data?.title??r.title??'').filter(Boolean).join('\n');}}catch{}}await this.storage.call('runUpdate',{id:run.id,status:'succeeded',result:summary});if(tool&&tool.definition.kind!=='workflow')await this.storage.call('toolUsage',{id:run.id,toolId:tool.id,version:tool.version,outcome:'succeeded'});
   }catch(e:any){await this.storage.call('runUpdate',{id:run.id,status:'failed',result:e.message});if(tool&&tool.definition.kind!=='workflow')await this.storage.call('toolUsage',{id:run.id,toolId:tool.id,version:tool.version,outcome:'failed'});}finally{const saved=await this.storage.call('runGet',{id:run.id});if(saved?.session_id)this.workflowRuns.delete(saved.session_id);this.active.delete(run.id);}};
   const promise=execute();this.active.set(run.id,promise);return run;
  }
- async channelTurn(text:string,key:string,signal:AbortSignal,onSession:(id:string)=>Promise<void>,existingId?:string){signal.throwIfAborted();let sessionId=existingId;if(!sessionId||!(await this.storage.call('conversationList')).some((r:any)=>r.session_id===sessionId))sessionId=(await this.createConversation('微信 · '+text.slice(0,24))).sessionId;if(await this.storage.call('conversationNeedsRebind',{sessionId})){const previous=sessionId;sessionId=(await this.createConversation('微信 · '+text.slice(0,24))).sessionId;await this.storage.call('conversationRebind',{previous,sessionId});}await onSession(sessionId!);const cancel=()=>this.ctx.agents.get(sessionId)?.cancel({kind:'user'},{keepInbox:true});signal.addEventListener('abort',cancel,{once:true});try{try{return(await this.runTurn(sessionId!,text,'weixin:'+key,600000)).text;}catch(e:any){if(e.code!=='session/not-found')throw e;const previous=sessionId;sessionId=(await this.createConversation('微信 · '+text.slice(0,24))).sessionId;await this.storage.call('conversationRebind',{previous,sessionId});await onSession(sessionId!);return(await this.runTurn(sessionId!,text,'weixin:'+key,600000)).text;}}finally{signal.removeEventListener('abort',cancel);}}
+ async channelTurn(text:string,key:string,signal:AbortSignal,onSession:(id:string)=>Promise<void>,existingId?:string){signal.throwIfAborted();let sessionId=existingId;if(!sessionId||!(await this.storage.call('conversationList')).some((r:any)=>r.session_id===sessionId))sessionId=(await this.createConversation('微信 · '+text.slice(0,24))).sessionId;if(await this.storage.call('conversationNeedsRebind',{sessionId})){const previous=sessionId;sessionId=(await this.createConversation('微信 · '+text.slice(0,24))).sessionId;await this.storage.call('conversationRebind',{previous,sessionId});}await onSession(sessionId!);const cancel=()=>{if(sessionId)this.ctx.agents.get(sessionId)?.cancel({kind:'user'},{keepInbox:true});};signal.addEventListener('abort',cancel,{once:true});try{try{return(await this.runTurn(sessionId!,text,'weixin:'+key,600000)).text;}catch(e:any){if(e.code!=='session/not-found')throw e;const previous=sessionId;sessionId=(await this.createConversation('微信 · '+text.slice(0,24))).sessionId;await this.storage.call('conversationRebind',{previous,sessionId});await onSession(sessionId!);return(await this.runTurn(sessionId!,text,'weixin:'+key,600000)).text;}}finally{signal.removeEventListener('abort',cancel);}}
  async runTurn(sessionId:string,text:string,requestId:string,timeout:number){
   const settings=await this.command('settingsGet',{});const before=this.ctx.agents.get(sessionId)?.session.snapshotEvents().length??0;
   await this.ctx.sessionController.prompt({sessionId,requestId,content:[{type:'text',text}],clientTimeZone:settings.timezone},new AbortController().signal);
