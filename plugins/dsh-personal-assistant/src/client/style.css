@@ -7,3 +7,23 @@
 @media(prefers-color-scheme:dark){.pa-app{--pa-bg:#191e1c;--pa-surface:#222926;--pa-text:#e3e9e5;--pa-muted:#9ba9a1;--pa-line:#354039;--pa-accent:#569b7c;--pa-soft:#2b4035}.pa-app button:hover{border-color:#567863}.pa-tag{color:#b9d4c4}.pa-nav button span{background:#3b5747}.pa-error{background:#4f2e25;border-color:#704837;color:#ffd7c8}.pa-warm{background:#584923;color:#f4d790}.pa-app .pa-primary{color:#fff}.pa-app .pa-primary:hover{background:#397f60}}
 
 .pa-app.pa-desktop .pa-header{padding-top:50px}.pa-run-title{font-size:14px;font-weight:550;min-width:120px;flex:1}
+
+
+/* UI batch 1 */
+.pa-clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.pa-overlay{position:fixed;inset:0;z-index:60;pointer-events:none}
+.pa-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:70;background:var(--pa-accent,#286b58);color:#fff;padding:10px 16px;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.18);font-size:14px;pointer-events:none}
+.pa-toast-error{background:#a33}
+.pa-today{gap:16px}
+.pa-today-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.pa-today-grid textarea{min-height:84px;width:100%;resize:vertical}
+.pa-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--pa-line,#e6e8ea)}
+.pa-row:last-child{border-bottom:0}
+@container (max-width:760px){.pa-today-grid{grid-template-columns:minmax(0,1fr)}}
+.pa-overlay .pa-dialog{pointer-events:auto}
+
+.pa-clamp{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.pa-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:80;background:#1f2321;color:#fff;padding:10px 16px;border-radius:10px;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+.pa-today-grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));margin-top:16px}
+.pa-row{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid #e6e8ea;font-size:13px}
+.pa-row:last-of-type{border-bottom:0}
