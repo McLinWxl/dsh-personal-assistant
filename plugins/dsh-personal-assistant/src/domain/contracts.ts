@@ -56,18 +56,18 @@ export const workflowSchema = z.strictObject({ title: text, description: z.strin
 // preserve omission, so remove creation defaults before making fields optional.
 function patchSchema(schema:z.ZodObject<any>){return z.strictObject(Object.fromEntries(Object.entries(schema.shape).map(([key,value])=>{let field=value as z.ZodType;while(field instanceof z.ZodDefault)field=field.unwrap() as z.ZodType;return[key,field.optional()];})));}
 export const schemas = {
-  overview: z.strictObject({}), list: z.strictObject({ kind: z.enum(['memory','project','task','event','tool','entity']), query: z.string().max(500).default(''), projectId: id.optional(), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(100).default(40) }),
+  overview: z.strictObject({}), list: z.strictObject({ kind: z.enum(['memory','project','task','event','tool','entity']), query: z.string().max(500).default(''), projectId: id.optional(), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(100).default(40), sort: z.enum(['updated','created','title']).default('updated') }),
   get: z.strictObject({ id }), relations:z.strictObject({id}), settingsGet: z.strictObject({}), settingsSave: patchSchema(settingsSchema),
   projectCreate: projectSchema, projectEdit: z.strictObject({ id, revision: z.number().int(), patch: patchSchema(projectSchema) }),
   memoryCapture: memorySchema,
   memoryRefresh:z.strictObject({id,revision:z.number().int(),facts:z.array(fact).min(1).max(40),domains:labels,topics:labels}),
   memoryClassify:z.strictObject({id,revision:z.number().int(),domains:labels,topics:labels,reusable:z.boolean().optional()}),
   memoryPrune:z.strictObject({id,revision:z.number().int(),reason:z.enum(['expired','old-low-value'])}),
-  memoryEdit: z.strictObject({ id, revision: z.number().int(), patch: z.strictObject({ title:text.optional(), body:text.optional(), notes:z.string().max(10000).optional(), pinned:z.boolean().optional(), importance:z.number().int().min(1).max(5).optional(), domains:labels.optional(), topics:labels.optional(), visibility:z.enum(['personal','private']).optional() }) }),
+  memoryEdit: z.strictObject({ id, revision: z.number().int(), patch: z.strictObject({ title:text.optional(), body:text.optional(), notes:z.string().max(10000).optional(), pinned:z.boolean().optional(), importance:z.number().int().min(1).max(5).optional(), domains:labels.optional(), topics:labels.optional(), visibility:z.enum(['personal','private']).optional(), projectId:z.string().nullable().optional() }) }),
   memorySearch: z.strictObject({ query:text, projectId:id.optional(), purpose:z.enum(['personal','external']).default('personal'), limit:z.number().int().min(1).max(30).default(12) }),
   related: z.strictObject({ projectId:id }), associate: z.strictObject({ projectId:id, memories:z.array(version).max(30) }),
   consolidate: z.strictObject({ groups:z.array(z.strictObject({ memories:z.array(version).min(2).max(20), canonicalFacts:z.array(fact).min(1).max(50) })).max(20) }),
-  maintain: z.strictObject({}), changes: z.strictObject({ offset:z.number().int().nonnegative().default(0) }), change: z.strictObject({ id }), undo:z.strictObject({ id }),
+  maintain: z.strictObject({}), changes: z.strictObject({ offset:z.number().int().nonnegative().default(0) }), change: z.strictObject({ id }), undo:z.strictObject({ id }), redo:z.strictObject({ id }),
   remove: z.strictObject({ id, revision:z.number().int() }),
   memoryRemove:z.strictObject({id,revision:z.number().int()}),allowMerge:z.strictObject({id}),
   taskCreate:taskSchema, taskEdit:z.strictObject({id,revision:z.number().int(),patch:patchSchema(taskSchema)}),

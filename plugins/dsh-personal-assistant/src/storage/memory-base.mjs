@@ -424,12 +424,55 @@ export class MemoryStore {
         }
         if (modified) this.put(delta.table_name, before.id, before.kind, data);
       }
+      result.snapshot = deltas.map(d => ({ table: d.table_name, id: d.object_id, revision: this.version(d.table_name, d.object_id), clocks: this.get(d.table_name, d.object_id)?.clocks ?? null }));
       // A later edit may have removed an endpoint required by restored relations: atomic failure, never a broken graph.
       if (this.db.prepare('PRAGMA foreign_key_check').all().length) fail('UNDO_DEPENDENCY_CONFLICT');
       for (const pair of change.summary.pairs) this.db.prepare('INSERT OR IGNORE INTO merge_blocks VALUES(?)').run(pair);
       this.db.prepare('UPDATE changes SET status=?,undo_result=? WHERE id=?')
         .run(result.preserved.length ? 'undone-with-preserved-edits' : 'undone', JSON.stringify(result), id);
       this.db.prepare('INSERT INTO outbox VALUES(?,?,?)').run(`undo:${id}`, 'maintenance.undone', JSON.stringify(result));
+      return result;
+    });
+  }
+
+  redo(id, key) {
+    return this.command(key, { action: 'redo', id }, () => {
+      const change = this.change(id);
+      if (!String(change.status).startsWith('undone')) fail('UNDO_REQUIRED');
+      const deltas = this.rollbackItems(id);
+      const snapshot = new Map((change.undoResult?.snapshot ?? []).map(s => [s.table + ':' + s.id, s]));
+      const result = { changeId: id, restoredFields: 0, restoredObjects: 0, preserved: [] };
+      const parse = value => (value ? JSON.parse(value) : null);
+      for (const delta of deltas) {
+        const before = parse(delta.before_json);
+        const after = parse(delta.after_json);
+        const current = this.get(delta.table_name, delta.object_id);
+        const snap = snapshot.get(delta.table_name + ':' + delta.object_id);
+        if (!before && after) {
+          if (current) { result.preserved.push({ id: delta.object_id, field: '*', reason: 'later-object-change' }); continue; }
+          this.put(delta.table_name, after.id, after.kind, after.data);
+          result.restoredObjects++; continue;
+        }
+        if (!after && before) {
+          if (!current) { result.preserved.push({ id: delta.object_id, field: '*', reason: 'later-deletion' }); continue; }
+          if (snap && current.revision !== snap.revision) { result.preserved.push({ id: delta.object_id, field: '*', reason: 'later-object-change' }); continue; }
+          this.put(delta.table_name, before.id, before.kind, null);
+          result.restoredObjects++; continue;
+        }
+        if (!current) { result.preserved.push({ id: delta.object_id, field: '*', reason: 'later-deletion' }); continue; }
+        const data = clone(current.data); let modified = false;
+        for (const field of new Set([...Object.keys(before.data), ...Object.keys(after.data)])) {
+          if (equal(before.data[field], after.data[field])) continue;
+          if (snap && current.clocks[field] !== snap.clocks?.[field]) { result.preserved.push({ id: after.id, field, reason: 'later-field-edit' }); continue; }
+          if (Object.hasOwn(after.data, field)) data[field] = after.data[field]; else delete data[field];
+          modified = true; result.restoredFields++;
+        }
+        if (modified) this.put(delta.table_name, after.id, after.kind, data);
+      }
+      if (this.db.prepare('PRAGMA foreign_key_check').all().length) fail('REDO_DEPENDENCY_CONFLICT');
+      this.db.prepare('UPDATE changes SET status=?, undo_result=? WHERE id=?')
+        .run(result.preserved.length ? 'redone-with-preserved-edits' : 'redone', JSON.stringify({ ...change.undoResult, redo: result }), id);
+      this.db.prepare('INSERT OR REPLACE INTO outbox VALUES(?,?,?)').run('redo:' + id, 'maintenance.redone', JSON.stringify(result));
       return result;
     });
   }

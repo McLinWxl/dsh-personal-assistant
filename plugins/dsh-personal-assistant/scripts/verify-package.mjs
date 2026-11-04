@@ -6,6 +6,7 @@ const root=fileURLToPath(new URL('../',import.meta.url)),temp=mkdtempSync(join(t
 try{
  let archive;
  if(process.argv[2]) archive=resolve(process.argv[2]);
+ else if(!process.env.npm_execpath) throw new Error('RUN_VIA_NPM_SCRIPT: run "npm run check:package" or pass an archive path');
  else {
   const packed=spawnSync(process.execPath,[process.env.npm_execpath,'pack','--ignore-scripts','--json','--pack-destination',temp],{cwd:root,encoding:'utf8'});
   if(packed.status!==0)throw packed.error??new Error(packed.stderr);

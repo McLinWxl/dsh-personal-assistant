@@ -84,7 +84,13 @@ export class Store extends Base {
       case'projectCreate':if(['model','maintenance'].includes(actor.kind))fail('USE_PROJECT_RESOLVE');return this.create('project',a,key);
       case'projectEdit':return this.edit(a.id,'project',a.patch,a.revision,key);
       case'memoryCapture':return this.capture(a,key,actor);
-      case'memoryEdit':return this.edit(a.id,'memory',a.patch,a.revision,key,true);
+      case'memoryEdit':{const extra:any[]=[];
+        if(Object.hasOwn(a.patch,'projectId')){const projectId=a.patch.projectId||null;if(projectId)this.node(projectId,'project');
+          const links=this.all('edges').filter((e:any)=>e.data.to===a.id&&e.data.kind==='belongs_to');
+          for(const edge of links)if(edge.data.from!==projectId)extra.push({id:edge.id,table:'edges',before:edge,data:null});
+          if(projectId&&!links.some((e:any)=>e.data.from===projectId))extra.push({id:randomUUID(),table:'edges',kind:'edge',data:{from:projectId,to:a.id,kind:'belongs_to'}});
+          a.patch.projectId=projectId;}
+        return this.edit(a.id,'memory',a.patch,a.revision,key,true,extra);}
       case'memoryRefresh':{const row=this.node(a.id,'memory');if(!row.data.derivedDirty)fail('MEMORY_ALREADY_CURRENT');return this.edit(a.id,'memory',{facts:a.facts,canonicalFacts:a.facts,derivedDirty:false,domains:row.data.manualFields?.includes('domains')?row.data.domains:a.domains,topics:row.data.manualFields?.includes('topics')?row.data.topics:a.topics},a.revision,key);}
       case'memoryClassify':{const row=this.node(a.id,'memory');const patch:any={};for(const field of ['domains','topics','reusable'])if(a[field]!==undefined&&!row.data.manualFields?.includes(field)){patch[field]=field==='reusable'?a[field]&&['method','fact'].includes(row.data.type):a[field];}return this.edit(a.id,'memory',patch,a.revision,key);}
       case'memoryPrune':{const row=this.node(a.id,'memory'),d=row.data;const last=Math.max(d.createdAt??0,...d.observations.map((o:any)=>Date.parse(o.at)));if(d.pinned||d.protected||d.manualFields?.length||d.notes||d.importance>2||!['fact','method'].includes(d.type)||last>this.now()-365*86400000||this.all('edges').some((e:any)=>e.data.from===a.id||e.data.to===a.id))fail('MEMORY_REQUIRES_RETENTION');if(a.reason==='expired'&&(!d.validTo||Date.parse(d.validTo)>this.now()))fail('MEMORY_NOT_EXPIRED');return this.remove(a.id,a.revision,key);}
@@ -94,8 +100,14 @@ export class Store extends Base {
       case'consolidate':return this.command(key,{command,a},()=>{const result=this.commitPlan(this.planSemanticConsolidation(a.groups));if(result.changeId)this.notify('maintenance.completed',result,result.changeId);return result;});
       case'maintain':return this.command(key,{command},()=>{const result=this.commitPlan(this.planConsolidation());if(result.changeId)this.notify('maintenance.completed',result,result.changeId);return result;});
       case'changes':return this.db.prepare('SELECT id FROM changes ORDER BY created_at DESC,id LIMIT 40 OFFSET ?').all(a.offset).map((r:any)=>this.change(r.id));
-      case'change':{const c=this.change(a.id);return{...c,expiresDisplay:formattedDeadline(c.expiresAt,this.settings.timezone),items:this.now()<c.expiresAt?this.rollbackItems(a.id).map((d:any)=>({id:d.object_id,before:JSON.parse(d.before_json),after:d.after_json?JSON.parse(d.after_json):null})):[]};}
+      case'change':{const c=this.change(a.id);const live=this.now()<c.expiresAt?this.rollbackItems(a.id):[];const parse=(value:any)=>value?JSON.parse(value):null;
+        const items=live.map((d:any)=>{const before=parse(d.before_json),after=parse(d.after_json);const fields:any[]=[];
+          if(before?.data&&after?.data)for(const name of new Set([...Object.keys(before.data),...Object.keys(after.data)]))if(JSON.stringify(before.data[name])!==JSON.stringify(after.data[name]))fields.push({name,before:before.data[name],after:after.data[name]});
+          return{id:d.object_id,before,after,fields};});
+        const deltas=live.map((d:any)=>({tableName:d.table_name,objectId:d.object_id,before:parse(d.before_json),after:parse(d.after_json)}));
+        return{...c,expiresDisplay:formattedDeadline(c.expiresAt,this.settings.timezone),items,deltas};}
       case'undo':return this.command(key,{command,a},()=>{const result=super.undo(a.id,key+':undo');this.projects.undo(a.id);this.notify('maintenance.undone',result,'undo:'+a.id);return result;});
+      case'redo':return this.command(key,{command,a},()=>{const result=super.redo(a.id,key+':redo');this.notify('maintenance.redone',result,'redo:'+a.id);return result;});
       case'remove':return this.remove(a.id,a.revision,key);
       case'memoryRemove':if(actor.kind==='maintenance')fail('MAINTENANCE_COMMAND_NOT_ALLOWED');this.node(a.id,'memory');return this.remove(a.id,a.revision,key);
       case'allowMerge':{const change=this.change(a.id);if(!change.status.startsWith('undone'))fail('UNDO_REQUIRED');for(const pair of change.summary.pairs??[])this.db.prepare('DELETE FROM merge_blocks WHERE pair_hash=?').run(pair);return{allowed:true};}
@@ -123,13 +135,14 @@ export class Store extends Base {
     if(a.query){sql+=" AND (json_extract(data,'$.title') LIKE ? ESCAPE '\\' OR json_extract(data,'$.body') LIKE ? ESCAPE '\\')";const q='%'+a.query.replace(/[\\%_]/g,(s:string)=>'\\'+s)+'%';params.push(q,q);}
     if(a.projectId){this.node(a.projectId,'project');sql+=' AND (id IN (SELECT to_id FROM edges WHERE from_id=?) OR json_extract(data,\'$.projectId\')=?)';params.push(a.projectId,a.projectId);}
     const total=Number(this.db.prepare(sql.replace('SELECT id','SELECT COUNT(*) AS n')).get(...params).n);
-    const rows=this.db.prepare(sql+" ORDER BY COALESCE(CASE WHEN kind='memory' THEN json_extract(data,'$.observations[#-1].at') END,json_extract(data,'$.createdAt'),0) DESC,id LIMIT ? OFFSET ?").all(...params,a.limit,a.offset).map((r:any)=>this.node(r.id));return{items:rows,total,offset:a.offset};
+    const order=a.sort==='title'?"json_extract(data,'$.title') COLLATE NOCASE ASC,id":a.sort==='created'?"COALESCE(json_extract(data,'$.createdAt'),0) DESC,id":"COALESCE(CASE WHEN kind='memory' THEN json_extract(data,'$.observations[#-1].at') END,json_extract(data,'$.createdAt'),0) DESC,id";
+    const rows=this.db.prepare(sql+' ORDER BY '+order+' LIMIT ? OFFSET ?').all(...params,a.limit,a.offset).map((r:any)=>this.node(r.id));return{items:rows,total,offset:a.offset};
   }
   create(kind:string,data:any,key:string){return this.command(key,{action:'create',kind,data},()=>{const id=randomUUID();const change=this.journal(kind+'.created',[{id,kind,data:{...clone(data),owner:this.owner(),...(kind==='event'?{uid:randomUUID()}:{}),createdAt:data.createdAt??this.now()}}]);return{id,revision:this.version('nodes',id),...change};});}
-  edit(id:string,kind:string,patch:any,revision:number,key:string,manual=false){return this.command(key,{action:'edit',id,kind,patch,revision},()=>{
+  edit(id:string,kind:string,patch:any,revision:number,key:string,manual=false,extra:any[]=[]){return this.command(key,{action:'edit',id,kind,patch,revision},()=>{
     const before=this.node(id,kind);if(before.revision!==revision)fail('STALE_VERSION');
     if(!manual&&Object.entries(patch).every(([k,v])=>JSON.stringify(before.data[k])===JSON.stringify(v)))return{id,revision:before.revision,unchanged:true};const data={...before.data,...patch};if(manual){data.manualFields=[...new Set([...(data.manualFields??[]),...Object.keys(patch)])];if('body'in patch){data.derivedDirty=true;data.canonicalFacts=[];}}
-    const change=this.journal(kind+'.updated',[{id,before,data,touched:Object.keys(patch)}]);return{id,revision:this.version('nodes',id),...change};});}
+    const change=this.journal(kind+'.updated',[{id,before,data,touched:Object.keys(patch)},...extra]);return{id,revision:this.version('nodes',id),...change};});}
   capture(a:any,key:string,actor:Actor){return this.command(key,{action:'capture',a},()=>{
     if(['model','maintenance'].includes(actor.kind)&&actor.sourceId!==a.sourceId&&!actor.allowedSourceIds?.includes(a.sourceId))fail('SOURCE_NOT_IN_CURRENT_TURN');
     const source=this.db.prepare('SELECT * FROM sources WHERE id=?').get(a.sourceId);if(actor.sessionId&&source?.session_id!==actor.sessionId)fail('SOURCE_SESSION_MISMATCH');if(!source||!source.text.includes(a.quote))fail('QUOTE_NOT_IN_SOURCE');
