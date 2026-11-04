@@ -57,6 +57,7 @@ export const workflowSchema = z.strictObject({ title: text, description: z.strin
 function patchSchema(schema:z.ZodObject<any>){return z.strictObject(Object.fromEntries(Object.entries(schema.shape).map(([key,value])=>{let field=value as z.ZodType;while(field instanceof z.ZodDefault)field=field.unwrap() as z.ZodType;return[key,field.optional()];})));}
 export const schemas = {
   overview: z.strictObject({}), list: z.strictObject({ kind: z.enum(['memory','project','task','event','tool','entity']), query: z.string().max(500).default(''), projectId: id.optional(), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(100).default(40), sort: z.enum(['updated','created','title']).default('updated') }),
+  searchAll: z.strictObject({ query: z.string().min(1).max(500), limit: z.number().int().min(1).max(50).default(20) }),
   get: z.strictObject({ id }), relations:z.strictObject({id}), settingsGet: z.strictObject({}), settingsSave: patchSchema(settingsSchema),
   projectCreate: projectSchema, projectEdit: z.strictObject({ id, revision: z.number().int(), patch: patchSchema(projectSchema) }),
   memoryCapture: memorySchema,

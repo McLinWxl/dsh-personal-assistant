@@ -299,7 +299,12 @@ interface RowData {
   parameters?: Record<string, unknown>;
   dependsOn?: string[];
   observations?: Array<{ at: string; body?: string }>;
-  originalClaims?: Array<{ at: string; body: string }>;
+  originalClaims?: Array<{ at: string; body: string; quote?: string }>;
+  facts?: Array<{ subject?: string; predicate?: string; value?: string }>;
+  canonicalFacts?: Array<{ subject?: string; predicate?: string; value?: string }>;
+  context?: Record<string, unknown>;
+  name?: string;
+  aliases?: string[];
   result?: string;
   selected?: boolean;
   createdAt?: string | number;
@@ -397,6 +402,107 @@ interface RelatedMemory {
   revision: number;
   title?: string;
   body?: string;
+}
+
+type SearchKind = 'memory' | 'project' | 'task' | 'event' | 'tool' | 'entity';
+
+interface SearchItem {
+  id: string;
+  kind: SearchKind;
+  title: string;
+  snippet?: string;
+}
+
+interface SearchResult {
+  query: string;
+  groups: Partial<Record<SearchKind, SearchItem[]>>;
+  total: number;
+}
+
+interface HealthReport {
+  integrity?: string;
+  foreignKeyErrors?: unknown;
+  foreignKeys?: unknown;
+  nodes?: unknown;
+  edges?: unknown;
+  changes?: unknown;
+  rollbackItems?: unknown;
+  outbox?: unknown;
+  dataRoot?: string;
+  schemaVersion?: number;
+}
+
+type Density = 'standard' | 'compact';
+
+function readDensity(): Density {
+  try {
+    return localStorage.getItem('pa.density') === 'compact' ? 'compact' : 'standard';
+  } catch {
+    return 'standard';
+  }
+}
+
+function readLastExport(): { at: number; name: string; destination?: string } | null {
+  try {
+    const raw = localStorage.getItem('pa.lastExport');
+    if (!raw) return null;
+    const value = JSON.parse(raw) as { at?: number; name?: string; destination?: string };
+    if (!value || typeof value.at !== 'number' || typeof value.name !== 'string') return null;
+    return { at: value.at, name: value.name, destination: value.destination };
+  } catch {
+    return null;
+  }
+}
+
+function countValue(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (Array.isArray(value)) return value.length;
+  return null;
+}
+
+function baseName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      const ok = document.execCommand('copy');
+      area.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+async function exportBackup(
+  api: Api,
+): Promise<{ at: number; name: string; destination: string; files?: number } | null> {
+  const parent = await api<string | null>('native.pickDirectory');
+  if (!parent) return null;
+  const destination = await api<string>('data.exportDestination', { parent });
+  const result = await api<{ destination?: string; files?: number }>('data.export', {
+    destination,
+    requestId: crypto.randomUUID(),
+  });
+  const actual = result?.destination ?? destination;
+  return {
+    at: Date.now(),
+    name: baseName(actual),
+    destination: actual,
+    files: result?.files,
+  };
 }
 
 interface Job {
@@ -1523,6 +1629,8 @@ interface RecordDialogProps {
   timezone: string;
   onClose: () => void;
   onChanged: () => void;
+  inline?: boolean;
+  onQuickCreate?: (kind: 'task', projectId: string) => void;
 }
 
 function RecordDialog({
@@ -1535,6 +1643,8 @@ function RecordDialog({
   timezone,
   onClose,
   onChanged,
+  inline = false,
+  onQuickCreate,
 }: RecordDialogProps) {
   const [row, setRow] = useState<Row | null>(seed ?? null);
   const [mode, setMode] = useState<'read' | 'edit'>(create ? 'edit' : initialMode);
@@ -1546,6 +1656,9 @@ function RecordDialog({
   );
   const [relations, setRelations] = useState<Relation[]>([]);
   const [related, setRelated] = useState<RelatedMemory[]>([]);
+  const [projectTasks, setProjectTasks] = useState<Row[]>([]);
+  const [projectCounts, setProjectCounts] = useState({ memory: 0, task: 0 });
+  const relatedRef = useRef<HTMLElement | null>(null);
   const [loading, setLoading] = useState(!create);
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -1561,10 +1674,23 @@ function RecordDialog({
       const rows = await command<Relation[]>(api, 'relations', { id });
       setRelations(rows);
       if (kind === 'project') {
-        const memories = await command<RelatedMemory[]>(api, 'related', {
-          projectId: id,
-        });
+        const [memories, tasks, memoryTotal, taskTotal] = await Promise.all([
+          command<RelatedMemory[]>(api, 'related', { projectId: id }),
+          command<ListResult>(api, 'list', {
+            kind: 'task',
+            projectId: id,
+            limit: 8,
+            sort: 'updated',
+          }),
+          command<ListResult>(api, 'list', { kind: 'memory', projectId: id, limit: 1 }),
+          command<ListResult>(api, 'list', { kind: 'task', projectId: id, limit: 1 }),
+        ]);
         setRelated(memories);
+        setProjectTasks(tasks.items);
+        setProjectCounts({
+          memory: memoryTotal.total,
+          task: taskTotal.total,
+        });
       }
     } catch {
       setRelations([]);
@@ -1598,6 +1724,30 @@ function RecordDialog({
   const title = create
     ? `新建${kindLabel(kind)}`
     : row?.data.title ?? `${kindLabel(kind)}详情`;
+
+  const requestClose = async () => {
+    if (dirty) {
+      const ok = await confirm({
+        title: '放弃未保存的修改？',
+        body: '关闭后，本次填写的内容不会保存。',
+        confirmLabel: '放弃修改',
+      });
+      if (!ok) return;
+    }
+    onClose();
+  };
+
+  useEffect(() => {
+    if (!inline) return;
+    const handler = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      if (document.querySelector('.pa-modal')) return;
+      event.preventDefault();
+      void requestClose();
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  });
 
   const handleSave = async (event: FormEvent) => {
     event.preventDefault();
@@ -1704,6 +1854,9 @@ function RecordDialog({
     meta.push({ label: '类别', value: LABELS[data.type] ?? data.type });
   }
   if (data.importance) meta.push({ label: '重要性', value: String(data.importance) });
+  if ((data.domains ?? []).length > 0) {
+    meta.push({ label: '领域', value: (data.domains ?? []).join('、') });
+  }
   if (data.dueAt) meta.push({ label: '截止', value: formatDate(data.dueAt, timezone) });
   if (data.projectId) {
     const project = projects.find((item) => item.id === data.projectId);
@@ -1714,43 +1867,257 @@ function RecordDialog({
   }
   if (data.location) meta.push({ label: '地点', value: data.location });
 
-  return (
-    <Modal
-      title={title}
-      onClose={onClose}
-      dirty={dirty}
-      wide={mode === 'edit' && kind === 'event'}
-    >
-      {loading ? (
-        <div className="pa-dialog-body">
-          <div className="pa-skeleton-line" />
-          <div className="pa-skeleton-line pa-skeleton-short" />
+  const projectName = data.projectId
+    ? projects.find((item) => item.id === data.projectId)?.data.title ?? ''
+    : '';
+  const facts = data.canonicalFacts ?? data.facts ?? [];
+  const memoryRelations = relations.filter((relation) => relation.object.kind === 'memory');
+  const otherRelations = relations.filter((relation) => relation.object.kind !== 'memory');
+  const relationLabel = (relation: Relation) =>
+    ({
+      belongs_to: '所属',
+      reuses_method: '复用',
+      about: '主题',
+      related_to: '相关',
+    })[relation.kind] ?? relation.kind;
+
+  const refreshRecord = async () => {
+    if (row) {
+      try {
+        const fresh = await command<Row>(api, 'get', { id: row.id });
+        setRow(fresh);
+        setForm(formFromRow(kind, fresh, timezone));
+        setBaseline(formFromRow(kind, fresh, timezone));
+      } catch {
+        /* keep the stale view; the parent refresh still runs */
+      }
+    }
+    onChanged();
+  };
+
+  const metaNode =
+    meta.length > 0 ? (
+      <div className="pa-detail-meta">
+        {meta.map((item) => (
+          <span className="pa-tag" key={item.label}>
+            {item.label}：{item.value}
+          </span>
+        ))}
+      </div>
+    ) : null;
+
+  const observationsNode = (data.observations ?? []).length > 0 && (
+    <section className="pa-detail-section">
+      <h3>观察记录</h3>
+      {(data.observations ?? []).map((item, index) => (
+        <div className="pa-meta" key={`${item.at}-${index}`}>
+          {formatDate(item.at, timezone)} {item.body ?? ''}
         </div>
-      ) : mode === 'read' ? (
+      ))}
+    </section>
+  );
+
+  const content = loading ? (
+    <div className="pa-dialog-body">
+      <div className="pa-skeleton-line" />
+      <div className="pa-skeleton-line pa-skeleton-short" />
+    </div>
+  ) : mode === 'read' ? (
+    <>
+      {kind === 'memory' ? (
         <>
           <div className="pa-detail">
-            {meta.length > 0 && (
-              <div className="pa-detail-meta">
-                {meta.map((item) => (
-                  <span className="pa-tag" key={item.label}>
-                    {item.label}：{item.value}
-                  </span>
-                ))}
+            <section className="pa-detail-section pa-detail-first">
+              <h3>概要</h3>
+              {metaNode}
+              {body && <p className="pa-detail-body">{body}</p>}
+              {data.notes && <p className="pa-detail-note">{data.notes}</p>}
+              {observationsNode}
+            </section>
+            <section className="pa-detail-section">
+              <h3>事实</h3>
+              {facts.length === 0 ? (
+                <p className="pa-detail-note">还没有提炼出结构化事实。</p>
+              ) : (
+                facts.map((fact, index) => (
+                  <article key={`${fact.subject ?? ''}-${index}`}>
+                    <h3>
+                      {fact.subject || '—'}
+                      {fact.predicate ? ` · ${fact.predicate}` : ''}
+                    </h3>
+                    <p>{fact.value || '—'}</p>
+                  </article>
+                ))
+              )}
+              {(data.originalClaims ?? []).length > 0 && (
+                <div className="pa-claims">
+                  <h4>原话</h4>
+                  {(data.originalClaims ?? []).map((claim, index) => (
+                    <blockquote key={`${claim.at}-${index}`}>
+                      {claim.quote ?? claim.body}
+                      <cite>{formatDate(claim.at, timezone)}</cite>
+                    </blockquote>
+                  ))}
+                </div>
+              )}
+            </section>
+            <section className="pa-detail-section">
+              <h3>关联</h3>
+              {projectName && <p className="pa-meta">所属项目：{projectName}</p>}
+              {memoryRelations.length > 0 && (
+                <div className="pa-related-list">
+                  <h4>相关记忆</h4>
+                  {memoryRelations.map((relation) => (
+                    <article key={relation.id}>
+                      <span className="pa-tag">{relationLabel(relation)}</span>
+                      <h3>{relation.object.data.title || '未命名记忆'}</h3>
+                      <p>{bodyTextOf('memory', relation.object.data)}</p>
+                    </article>
+                  ))}
+                </div>
+              )}
+              {otherRelations.length > 0 && (
+                <div className="pa-related-list">
+                  <h4>关系</h4>
+                  {otherRelations.map((relation) => (
+                    <article key={relation.id}>
+                      <span className="pa-tag">{relationLabel(relation)}</span>
+                      <h3>
+                        {relation.object.data.title ||
+                          relation.object.data.name ||
+                          '未命名'}
+                      </h3>
+                    </article>
+                  ))}
+                </div>
+              )}
+              {!projectName && relations.length === 0 && (
+                <p className="pa-detail-note">暂无关联。</p>
+              )}
+            </section>
+            {row && <RecordHistory api={api} id={row.id} onChanged={() => void refreshRecord()} />}
+            {error && <div role="alert" className="pa-error">{error}</div>}
+          </div>
+          <footer className="pa-dialog-footer">
+            <button type="button" onClick={onClose}>关闭</button>
+            <button
+              type="button"
+              className="pa-primary"
+              onClick={() => setMode('edit')}
+            >
+              编辑
+            </button>
+          </footer>
+        </>
+      ) : kind === 'project' ? (
+        <>
+          <div className="pa-detail">
+            <section className="pa-detail-section pa-detail-first">
+              <h3>概览</h3>
+              {metaNode}
+              {data.goal && <p className="pa-detail-body">{data.goal}</p>}
+              <div className="pa-tags">
+                <span className="pa-tag">记忆 {projectCounts.memory}</span>
+                <span className="pa-tag">任务 {projectCounts.task}</span>
               </div>
-            )}
+              {Object.entries(data.context ?? {}).length > 0 && (
+                <div className="pa-context">
+                  <h4>上下文</h4>
+                  {Object.entries(data.context ?? {}).map(([key, value]) => (
+                    <div className="pa-meta" key={key}>
+                      <b>{key}</b>：{textOf(value) || '—'}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+            <section className="pa-detail-section" ref={relatedRef}>
+              <h3>相关记忆</h3>
+              {relations.filter((relation) => relation.object.kind === 'memory').length > 0 && (
+                <div className="pa-related-list">
+                  <h4>已关联</h4>
+                  {relations
+                    .filter((relation) => relation.object.kind === 'memory')
+                    .map((relation) => (
+                      <article key={relation.id}>
+                        <span className="pa-tag">记忆</span>
+                        <h3>{relation.object.data.title || '未命名记忆'}</h3>
+                        <p>{bodyTextOf('memory', relation.object.data)}</p>
+                      </article>
+                    ))}
+                </div>
+              )}
+              {related.length === 0 && relations.filter((relation) => relation.object.kind === 'memory').length === 0 ? (
+                <p className="pa-detail-note">还没有关联记忆，可在下方选择候选记忆关联。</p>
+              ) : (
+                related.map((memory) => (
+                  <article key={memory.id}>
+                    <h3>{memory.title || '未命名记忆'}</h3>
+                    <p>{memory.body}</p>
+                    <button
+                      type="button"
+                      disabled={busyKey !== ''}
+                      onClick={() => void associate(memory)}
+                    >
+                      {busyKey === `associate:${memory.id}` ? '处理中…' : '关联'}
+                    </button>
+                  </article>
+                ))
+              )}
+            </section>
+            <section className="pa-detail-section">
+              <h3>关联任务</h3>
+              {projectTasks.length === 0 ? (
+                <p className="pa-detail-note">这个项目下还没有任务。</p>
+              ) : (
+                projectTasks.map((task) => (
+                  <article key={task.id}>
+                    <h3>{task.data.title || '未命名任务'}</h3>
+                    <p>
+                      {statusText('task', task.data)}
+                      {task.data.dueAt ? ` · 截止 ${formatDate(task.data.dueAt, timezone)}` : ''}
+                    </p>
+                  </article>
+                ))
+              )}
+            </section>
+            {row && <RecordHistory api={api} id={row.id} onChanged={() => void refreshRecord()} />}
+            {error && <div role="alert" className="pa-error">{error}</div>}
+          </div>
+          <footer className="pa-dialog-footer">
+            <button
+              type="button"
+              onClick={() => {
+                if (row && onQuickCreate) onQuickCreate('task', row.id);
+                else notify('请回到项目列表，在工具栏新建任务。');
+              }}
+            >
+              新建任务
+            </button>
+            <button
+              type="button"
+              onClick={() => relatedRef.current?.scrollIntoView({ block: 'nearest' })}
+            >
+              关联记忆
+            </button>
+            <button type="button" onClick={onClose}>关闭</button>
+            <button
+              type="button"
+              className="pa-primary"
+              onClick={() => setMode('edit')}
+            >
+              编辑项目
+            </button>
+          </footer>
+        </>
+      ) : (
+        <>
+          <div className="pa-detail">
+            {metaNode}
             {body && <p className="pa-detail-body">{body}</p>}
             {data.notes && <p className="pa-detail-note">{data.notes}</p>}
             {data.result && <pre>{data.result}</pre>}
-            {(data.observations ?? []).length > 0 && (
-              <section className="pa-detail-section">
-                <h3>观察记录</h3>
-                {(data.observations ?? []).map((item, index) => (
-                  <div className="pa-meta" key={`${item.at}-${index}`}>
-                    {formatDate(item.at, timezone)} {item.body ?? ''}
-                  </div>
-                ))}
-              </section>
-            )}
+            {observationsNode}
             {kind === 'tool' && row && (
               <ToolVersions
                 api={api}
@@ -1768,33 +2135,8 @@ function RecordDialog({
                 <h3>关联</h3>
                 {relations.map((relation) => (
                   <article key={relation.id}>
-                    <span className="pa-tag">
-                      {{
-                        belongs_to: '所属',
-                        reuses_method: '复用',
-                        about: '主题',
-                        related_to: '相关',
-                      }[relation.kind] ?? relation.kind}
-                    </span>
-                    <h3>{relation.object.data.title}</h3>
-                  </article>
-                ))}
-              </section>
-            )}
-            {kind === 'project' && related.length > 0 && (
-              <section className="pa-detail-section">
-                <h3>相关经验</h3>
-                {related.map((memory) => (
-                  <article key={memory.id}>
-                    <h3>{memory.title}</h3>
-                    <p>{memory.body}</p>
-                    <button
-                      type="button"
-                      disabled={busyKey !== ''}
-                      onClick={() => void associate(memory)}
-                    >
-                      {busyKey === `associate:${memory.id}` ? '处理中…' : '关联'}
-                    </button>
+                    <span className="pa-tag">{relationLabel(relation)}</span>
+                    <h3>{relation.object.data.title || relation.object.data.name || '未命名'}</h3>
                   </article>
                 ))}
               </section>
@@ -1821,51 +2163,1051 @@ function RecordDialog({
             </button>
           </footer>
         </>
+      )}
+    </>
+  ) : (
+    <form onSubmit={(event) => void handleSave(event)}>
+      <div className="pa-dialog-body">
+        <EditorFields
+          kind={kind}
+          form={form}
+          update={update}
+          projects={projects}
+          timezone={timezone}
+        />
+        {error && <div role="alert" className="pa-error">{error}</div>}
+      </div>
+      <footer className="pa-dialog-footer">
+        {row && (
+          <button
+            type="button"
+            className="pa-danger"
+            disabled={saving}
+            onClick={() => void handleDelete()}
+          >
+            删除
+          </button>
+        )}
+        <button
+          type="button"
+          disabled={saving}
+          onClick={() => {
+            if (row) {
+              setForm(formFromRow(kind, row, timezone));
+              setBaseline(formFromRow(kind, row, timezone));
+              setError('');
+              setMode('read');
+            } else {
+              onClose();
+            }
+          }}
+        >
+          取消
+        </button>
+        <button className="pa-primary" type="submit" disabled={saving}>
+          {saving ? '保存中…' : '保存'}
+        </button>
+      </footer>
+    </form>
+  );
+
+  if (inline) {
+    return (
+      <section className="pa-split-detail" aria-label={title}>
+        <header className="pa-split-head">
+          <h2>{title}</h2>
+          <button type="button" aria-label="关闭详情" onClick={() => void requestClose()}>
+            ×
+          </button>
+        </header>
+        {content}
+      </section>
+    );
+  }
+
+  return (
+    <Modal
+      title={title}
+      onClose={onClose}
+      dirty={dirty}
+      wide={mode === 'edit' && kind === 'event'}
+    >
+      {content}
+    </Modal>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Record history (recent changes touching one node)                   */
+/* ------------------------------------------------------------------ */
+
+function shortValue(value: unknown): string {
+  if (value === null || value === undefined || value === '') return '—';
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  if (text === undefined) return '—';
+  return text.length > 80 ? `${text.slice(0, 80)}…` : text;
+}
+
+function RecordHistory({
+  api,
+  id,
+  onChanged,
+}: {
+  api: Api;
+  id: string;
+  onChanged: () => void;
+}) {
+  const notify = useToast();
+  const confirm = useConfirm();
+  const [entries, setEntries] = useState<Array<{ change: ChangeDetail; item: ChangeItem }>>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const changes = await command<ChangeRecord[]>(api, 'changes', { offset: 0 });
+      const recent = (changes ?? []).slice(0, 12);
+      const details = await Promise.all(
+        recent.map((change) =>
+          command<ChangeDetail>(api, 'change', { id: change.id }).catch(() => null),
+        ),
+      );
+      const found: Array<{ change: ChangeDetail; item: ChangeItem }> = [];
+      for (const detail of details) {
+        if (!detail) continue;
+        const item = (detail.items ?? []).find(
+          (entry) =>
+            entry.id === id || entry.before?.id === id || entry.after?.id === id,
+        );
+        if (item) found.push({ change: detail, item });
+      }
+      setEntries(found);
+      setError('');
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [api, id]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const undo = async (change: ChangeRecord) => {
+    const ok = await confirm({
+      title: '撤回这次变更？',
+      body: '将把相关记录恢复到变更前的状态，已保留的编辑可能会被一并撤销。',
+      confirmLabel: '撤回',
+    });
+    if (!ok) return;
+    setBusy(change.id);
+    try {
+      await command(api, 'undo', { id: change.id });
+      notify('已撤回');
+      await load();
+      onChanged();
+    } catch (err) {
+      notify(message(err), { tone: 'error' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  if (loading) {
+    return (
+      <section className="pa-detail-section">
+        <h3>变更历史</h3>
+        <p className="pa-detail-note">正在读取最近整理记录…</p>
+      </section>
+    );
+  }
+  if (error) {
+    return (
+      <section className="pa-detail-section">
+        <h3>变更历史</h3>
+        <p className="pa-error-inline">{error}</p>
+      </section>
+    );
+  }
+  return (
+    <section className="pa-detail-section">
+      <h3>变更历史</h3>
+      {entries.length === 0 ? (
+        <p className="pa-detail-note">最近没有涉及这条记录的整理变更。</p>
       ) : (
-        <form onSubmit={(event) => void handleSave(event)}>
-          <div className="pa-dialog-body">
-            <EditorFields
-              kind={kind}
-              form={form}
-              update={update}
-              projects={projects}
-              timezone={timezone}
-            />
-            {error && <div role="alert" className="pa-error">{error}</div>}
+        entries.map(({ change, item }) => {
+          const canUndo =
+            change.status === 'applied' &&
+            (!change.expiresAt || change.expiresAt > Date.now());
+          return (
+            <article key={change.id} className="pa-history-entry">
+              <div className="pa-card-head">
+                <div>
+                  <h3>
+                    {item.before && !item.after
+                      ? '删除了这条记录'
+                      : !item.before && item.after
+                        ? '创建了这条记录'
+                        : '编辑了这条记录'}
+                  </h3>
+                  <p className="pa-meta">
+                    {formatDate(change.createdAt)} ·{' '}
+                    {LABELS[change.status] ?? change.status}
+                  </p>
+                </div>
+                {canUndo && (
+                  <button
+                    type="button"
+                    disabled={busy === change.id}
+                    onClick={() => void undo(change)}
+                  >
+                    {busy === change.id ? '撤回中…' : '撤回'}
+                  </button>
+                )}
+              </div>
+              {(item.fields ?? []).length > 0 && (
+                <div className="pa-history-fields">
+                  {(item.fields ?? []).map((field) => (
+                    <div key={field.name} className="pa-history-field">
+                      <span>{FIELD_LABELS[field.name] ?? field.name}</span>
+                      <s>{shortValue(field.before)}</s>
+                      <em>→</em>
+                      <b>{shortValue(field.after)}</b>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </article>
+          );
+        })
+      )}
+      <p className="pa-meta">仅显示最近 12 条整理记录中涉及这条记录的变更。</p>
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Memory timeline                                                     */
+/* ------------------------------------------------------------------ */
+
+function MemoryTimeline({
+  rows,
+  projects,
+  timezone,
+  onOpen,
+}: {
+  rows: Row[];
+  projects: Row[];
+  timezone: string;
+  onOpen: (row: Row) => void;
+}) {
+  const groups = useMemo(() => {
+    const sorted = [...rows].sort((a, b) => updatedTime(b) - updatedTime(a));
+    const map = new Map<string, Row[]>();
+    for (const row of sorted) {
+      const month = new Intl.DateTimeFormat('zh-CN', {
+        timeZone: timezone || undefined,
+        year: 'numeric',
+        month: 'long',
+      }).format(new Date(updatedTime(row)));
+      const list = map.get(month) ?? [];
+      list.push(row);
+      map.set(month, list);
+    }
+    return Array.from(map.entries());
+  }, [rows, timezone]);
+
+  const projectTitle = (projectId?: string | null) =>
+    projects.find((project) => project.id === projectId)?.data.title ?? '';
+
+  return (
+    <div className="pa-timeline">
+      {groups.map(([month, items]) => (
+        <section key={month} className="pa-timeline-month">
+          <div className="pa-timeline-month-label">{month}</div>
+          <div className="pa-timeline-items">
+            {items.map((row) => {
+              const project = projectTitle(row.data.projectId);
+              const observed = row.data.observations?.at(-1)?.at ?? updatedTime(row);
+              return (
+                <article key={row.id} className="pa-timeline-item">
+                  <div className="pa-timeline-date">
+                    {new Intl.DateTimeFormat('zh-CN', {
+                      timeZone: timezone || undefined,
+                      month: '2-digit',
+                      day: '2-digit',
+                    }).format(new Date(updatedTime(row)))}
+                  </div>
+                  <div className="pa-timeline-main">
+                    <div className="pa-timeline-head">
+                      <span className="pa-tag">{LABELS[row.data.type ?? ''] ?? '记忆'}</span>
+                      <button
+                        type="button"
+                        className="pa-title"
+                        onClick={() => onOpen(row)}
+                      >
+                        {row.data.title || '未命名记忆'}
+                      </button>
+                    </div>
+                    <p className="pa-clamp">{bodyTextOf('memory', row.data) || '（无摘要）'}</p>
+                    <div className="pa-tags">
+                      {project && <span className="pa-tag">{project}</span>}
+                      {(row.data.domains ?? []).map((domain) => (
+                        <span key={domain} className="pa-tag">
+                          {domain}
+                        </span>
+                      ))}
+                    </div>
+                    <div className="pa-timeline-meta">
+                      <span>最后观察 {formatDate(observed, timezone)}</span>
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Command palette (⌘K)                                                */
+/* ------------------------------------------------------------------ */
+
+const SEARCH_ORDER: SearchKind[] = [
+  'memory',
+  'project',
+  'task',
+  'event',
+  'tool',
+  'entity',
+];
+
+const SEARCH_KIND_LABEL: Record<SearchKind, string> = {
+  memory: '记忆',
+  project: '项目',
+  task: '任务',
+  event: '事件',
+  tool: '工具',
+  entity: '实体',
+};
+
+interface CommandEntry {
+  id: string;
+  label: string;
+  run: () => void;
+}
+
+function CommandPalette({
+  api,
+  density,
+  onClose,
+  onNavigate,
+  onOpenItem,
+  onCreateMemory,
+  onMaintain,
+  onExport,
+  onToggleDensity,
+  onHelp,
+}: {
+  api: Api;
+  density: Density;
+  onClose: () => void;
+  onNavigate: (tab: TabId) => void;
+  onOpenItem: (item: SearchItem) => void;
+  onCreateMemory: () => void;
+  onMaintain: () => void;
+  onExport: () => void;
+  onToggleDensity: () => void;
+  onHelp: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const debounced = useDebounced(query, 200);
+  const [results, setResults] = useState<SearchResult | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [error, setError] = useState('');
+  const [active, setActive] = useState(0);
+  const listRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const text = debounced.trim();
+    if (!text) {
+      setResults(null);
+      setSearching(false);
+      setError('');
+      return;
+    }
+    let live = true;
+    setSearching(true);
+    command<SearchResult>(api, 'searchAll', { query: text, limit: 20 })
+      .then((value) => {
+        if (!live) return;
+        setResults(value);
+        setError('');
+      })
+      .catch((err) => {
+        if (!live) return;
+        setError(message(err));
+        setResults(null);
+      })
+      .finally(() => {
+        if (live) setSearching(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [api, debounced]);
+
+  const commands: CommandEntry[] = [
+    { id: 'today', label: '切换到 今天', run: () => onNavigate('today') },
+    { id: 'memory', label: '切换到 记忆', run: () => onNavigate('memory') },
+    { id: 'project', label: '切换到 项目', run: () => onNavigate('project') },
+    { id: 'calendar', label: '切换到 日历', run: () => onNavigate('calendar') },
+    { id: 'task', label: '切换到 任务', run: () => onNavigate('task') },
+    { id: 'tool', label: '切换到 工具', run: () => onNavigate('tool') },
+    { id: 'inbox', label: '切换到 收件箱', run: () => onNavigate('inbox') },
+    { id: 'settings', label: '切换到 设置', run: () => onNavigate('settings') },
+    { id: 'new-memory', label: '新建记忆', run: onCreateMemory },
+    { id: 'maintain', label: '立即整理', run: onMaintain },
+    { id: 'export', label: '导出数据', run: onExport },
+    {
+      id: 'density',
+      label: `切换界面密度（当前：${density === 'compact' ? '紧凑' : '标准'}）`,
+      run: onToggleDensity,
+    },
+    { id: 'help', label: '快捷键帮助', run: onHelp },
+  ];
+
+  const groups: Array<{ title: string; items: SearchItem[] }> = [];
+  if (results) {
+    for (const kind of SEARCH_ORDER) {
+      const items = results.groups[kind] ?? [];
+      if (items.length > 0) groups.push({ title: SEARCH_KIND_LABEL[kind], items });
+    }
+  }
+  const lower = query.trim().toLowerCase();
+  const visibleCommands = commands.filter(
+    (entry) => !lower || entry.label.toLowerCase().includes(lower),
+  );
+  const totalEntries =
+    groups.reduce((sum, group) => sum + group.items.length, 0) + visibleCommands.length;
+
+  useEffect(() => {
+    setActive(0);
+  }, [debounced]);
+
+  useEffect(() => {
+    if (active < 0) setActive(0);
+    if (active >= totalEntries) setActive(Math.max(0, totalEntries - 1));
+  }, [active, totalEntries]);
+
+  useEffect(() => {
+    listRef.current
+      ?.querySelector<HTMLElement>('.pa-palette-item.pa-active')
+      ?.scrollIntoView({ block: 'nearest' });
+  }, [active]);
+
+  const runEntry = (entry: () => void) => {
+    onClose();
+    entry();
+  };
+
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if ((event.nativeEvent as { isComposing?: boolean }).isComposing) return;
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      if (totalEntries > 0) setActive((value) => (value + 1) % totalEntries);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (totalEntries > 0) setActive((value) => (value - 1 + totalEntries) % totalEntries);
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      const searchItems = groups.flatMap((group) => group.items);
+      if (active < searchItems.length) {
+        const item = searchItems[active];
+        const entry = item;
+        onClose();
+        onOpenItem(entry);
+      } else {
+        const entry = visibleCommands[active - searchItems.length];
+        if (entry) runEntry(entry.run);
+      }
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+    }
+  };
+
+  let index = 0;
+  return (
+    <Modal title="搜索与命令" onClose={onClose} wide>
+      <div className="pa-palette">
+        <input
+          className="pa-palette-input"
+          data-autofocus
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={onKeyDown}
+          placeholder="搜索记忆、项目、任务、事件、工具、实体，或输入命令…"
+          aria-label="搜索与命令"
+          role="combobox"
+          aria-expanded="true"
+          aria-controls="pa-palette-list"
+          aria-activedescendant={
+            totalEntries > 0 ? `pa-palette-option-${active}` : undefined
+          }
+        />
+        <div className="pa-palette-body" id="pa-palette-list" role="listbox" ref={listRef}>
+          {searching && <div className="pa-palette-empty">搜索中…</div>}
+          {!searching && error && <p className="pa-error-inline">{error}</p>}
+          {!searching && !error && totalEntries === 0 && (
+            <div className="pa-palette-empty">
+              {query.trim() ? '没有匹配结果。' : '输入关键词开始搜索，或选择下方命令。'}
+            </div>
+          )}
+          {groups.map((group) => (
+            <section key={group.title} className="pa-palette-group">
+              <h3>{group.title}</h3>
+              <div className="pa-palette-list">
+                {group.items.map((item) => {
+                  const current = index++;
+                  return (
+                    <button
+                      key={`${item.kind}:${item.id}`}
+                      id={`pa-palette-option-${current}`}
+                      type="button"
+                      role="option"
+                      aria-selected={active === current}
+                      className={cx('pa-palette-item', active === current && 'pa-active')}
+                      onMouseEnter={() => setActive(current)}
+                      onClick={() => {
+                        onClose();
+                        onOpenItem(item);
+                      }}
+                    >
+                      <span className="pa-palette-kind">{SEARCH_KIND_LABEL[item.kind]}</span>
+                      <strong>{item.title || '（无标题）'}</strong>
+                      {item.snippet && (
+                        <span className="pa-palette-snippet">{item.snippet}</span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+          ))}
+          {visibleCommands.length > 0 && (
+            <section className="pa-palette-group">
+              <h3>命令</h3>
+              <div className="pa-palette-list">
+                {visibleCommands.map((entry) => {
+                  const current = index++;
+                  return (
+                    <button
+                      key={entry.id}
+                      id={`pa-palette-option-${current}`}
+                      type="button"
+                      role="option"
+                      aria-selected={active === current}
+                      className={cx('pa-palette-item', active === current && 'pa-active')}
+                      onMouseEnter={() => setActive(current)}
+                      onClick={() => runEntry(entry.run)}
+                    >
+                      <strong>{entry.label}</strong>
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+        </div>
+        <div className="pa-palette-foot">
+          <span>
+            <span className="pa-kbd">↑</span>
+            <span className="pa-kbd">↓</span> 选择
+          </span>
+          <span>
+            <span className="pa-kbd">Enter</span> 打开
+          </span>
+          <span>
+            <span className="pa-kbd">Esc</span> 关闭
+          </span>
+          <span>⌘K 随时呼出</span>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function ShortcutHelp({ onClose }: { onClose: () => void }) {
+  const items: Array<{ keys: string[]; text: string }> = [
+    { keys: ['⌘', 'K'], text: '打开全局搜索与命令面板' },
+    { keys: ['Ctrl', 'K'], text: '同上（Windows / Linux）' },
+    { keys: ['/'], text: '聚焦当前页面的搜索框' },
+    { keys: ['n'], text: '在当前页面新建记录' },
+    { keys: ['?'], text: '打开本快捷键帮助' },
+    { keys: ['Esc'], text: '关闭弹窗 / 面板，焦点回到原处' },
+    { keys: ['↑', '↓'], text: '在搜索结果中移动' },
+    { keys: ['Enter'], text: '打开选中的结果或执行命令' },
+  ];
+  return (
+    <Modal title="快捷键帮助" onClose={onClose}>
+      <div className="pa-dialog-body">
+        <dl className="pa-help-list">
+          {items.map((item) => (
+            <div key={item.text} style={{ display: 'contents' }}>
+              <dt>
+                {item.keys.map((key) => (
+                  <span className="pa-kbd" key={key}>
+                    {key}
+                  </span>
+                ))}
+              </dt>
+              <dd>{item.text}</dd>
+            </div>
+          ))}
+        </dl>
+        <p className="pa-detail-note">
+          快捷键在输入框内不会触发；打开弹窗时按 Esc 先关闭最上层弹窗。
+        </p>
+      </div>
+    </Modal>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Entity peek                                                         */
+/* ------------------------------------------------------------------ */
+
+function EntityPeek({
+  api,
+  id,
+  onClose,
+}: {
+  api: Api;
+  id: string;
+  onClose: () => void;
+}) {
+  const [row, setRow] = useState<Row | null>(null);
+  const [relations, setRelations] = useState<Relation[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let live = true;
+    setLoading(true);
+    Promise.all([
+      command<Row>(api, 'get', { id }),
+      command<Relation[]>(api, 'relations', { id }).catch(() => []),
+    ])
+      .then(([value, edges]) => {
+        if (!live) return;
+        setRow(value);
+        setRelations(edges ?? []);
+        setError('');
+      })
+      .catch((err) => {
+        if (live) setError(message(err));
+      })
+      .finally(() => {
+        if (live) setLoading(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [api, id]);
+
+  const data = row?.data ?? {};
+  return (
+    <Modal title={data.name || data.title || '实体详情'} onClose={onClose}>
+      {loading ? (
+        <div className="pa-dialog-body">
+          <p className="pa-detail-note">正在读取实体…</p>
+        </div>
+      ) : error ? (
+        <div className="pa-dialog-body">
+          <p className="pa-error-inline">{error}</p>
+        </div>
+      ) : (
+        <>
+          <div className="pa-detail">
+            <div className="pa-detail-meta">
+              <span className="pa-tag">{LABELS[data.type ?? ''] ?? data.type ?? '实体'}</span>
+              {(data.domains ?? []).map((domain) => (
+                <span className="pa-tag" key={domain}>
+                  {domain}
+                </span>
+              ))}
+            </div>
+            {(data.aliases ?? []).length > 0 && (
+              <div className="pa-detail-section">
+                <h3>别名</h3>
+                <div className="pa-tags">
+                  {(data.aliases ?? []).map((alias) => (
+                    <span className="pa-tag" key={alias}>
+                      {alias}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="pa-detail-section">
+              <h3>关联</h3>
+              {relations.length === 0 ? (
+                <p className="pa-detail-note">暂无关联。</p>
+              ) : (
+                relations.map((relation) => (
+                  <article key={relation.id}>
+                    <h3>{relation.object.data.title || relation.object.data.name || '未命名'}</h3>
+                    <p>
+                      {LABELS[relation.kind] ?? relation.kind} ·{' '}
+                      {relation.direction ?? ''}
+                    </p>
+                  </article>
+                ))
+              )}
+            </div>
           </div>
           <footer className="pa-dialog-footer">
-            {row && (
-              <button
-                type="button"
-                className="pa-danger"
-                disabled={saving}
-                onClick={() => void handleDelete()}
-              >
-                删除
-              </button>
-            )}
-            <button
-              type="button"
-              disabled={saving}
-              onClick={() => {
-                if (row) {
-                  setForm(formFromRow(kind, row, timezone));
-                  setBaseline(formFromRow(kind, row, timezone));
-                  setError('');
-                  setMode('read');
-                } else {
-                  onClose();
-                }
-              }}
-            >
-              取消
-            </button>
-            <button className="pa-primary" type="submit" disabled={saving}>
-              {saving ? '保存中…' : '保存'}
+            <button type="button" onClick={onClose}>
+              关闭
             </button>
           </footer>
-        </form>
+        </>
       )}
+    </Modal>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Data health                                                         */
+/* ------------------------------------------------------------------ */
+
+function DataHealth({ api, root }: { api: Api; root: string }) {
+  const notify = useToast();
+  const [health, setHealth] = useState<HealthReport | null>(null);
+  const [overview, setOverview] = useState<Overview | null>(null);
+  const [lastExport, setLastExport] = useState(readLastExport);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState('');
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [report, summary] = await Promise.all([
+        command<HealthReport>(api, 'health', {}),
+        command<Overview>(api, 'overview'),
+      ]);
+      setHealth(report ?? null);
+      setOverview(summary ?? null);
+      setError('');
+    } catch (err) {
+      setError(message(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const maintain = async () => {
+    setBusy('maintain');
+    try {
+      await api('maintenance.run', { requestId: crypto.randomUUID() });
+      notify('已安排立即整理');
+      window.setTimeout(() => void load(), 1200);
+    } catch (err) {
+      notify(message(err), { tone: 'error' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const exportData = async () => {
+    setBusy('export');
+    try {
+      const record = await exportBackup(api);
+      if (!record) return;
+      try {
+        localStorage.setItem('pa.lastExport', JSON.stringify(record));
+      } catch {
+        /* ignore storage failures */
+      }
+      setLastExport(record);
+      notify(`已导出 ${record.name}`);
+    } catch (err) {
+      notify(message(err), { tone: 'error' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const openDirectory = async () => {
+    const path = health?.dataRoot || overview?.dataRoot || root;
+    if (!path) {
+      notify('还没有可用的数据目录。', { tone: 'error' });
+      return;
+    }
+    const ok = await copyText(path);
+    notify(ok ? '数据目录路径已复制到剪贴板。' : '复制失败，请手动选择路径。', {
+      tone: ok ? 'info' : 'error',
+    });
+  };
+
+  const fallbackNodes = overview
+    ? Object.values(overview.counts ?? {}).reduce((sum, value) => sum + (value ?? 0), 0)
+    : null;
+  const nodes = countValue(health?.nodes) ?? fallbackNodes;
+  const edges = countValue(health?.edges);
+  const changes = countValue(health?.changes);
+  const rollback = countValue(health?.rollbackItems);
+  const outbox = countValue(health?.outbox);
+  const foreign = countValue(health?.foreignKeyErrors ?? health?.foreignKeys);
+  const integrity = health?.integrity ?? '';
+  const integrityOk = integrity.toLowerCase() === 'ok';
+  const rootPath = health?.dataRoot || overview?.dataRoot || root;
+
+  const stat = (label: string, value: number | null | string, bad = false) => (
+    <div className={cx('pa-health-stat', bad && 'pa-health-bad')}>
+      <span>{label}</span>
+      <strong>{value === null || value === undefined || value === '' ? '—' : value}</strong>
+    </div>
+  );
+
+  return (
+    <section className="pa-settings-card">
+      <header>
+        <h3>数据健康</h3>
+        <button type="button" onClick={() => void load()} disabled={loading}>
+          {loading ? '读取中…' : '刷新'}
+        </button>
+      </header>
+      {error ? (
+        <p className="pa-error-inline">{error}</p>
+      ) : (
+        <>
+          <div className="pa-health-grid">
+            {stat('完整性', integrity ? (integrityOk ? '正常' : integrity) : '—', Boolean(integrity) && !integrityOk)}
+            {stat('外键错误', foreign, (foreign ?? 0) > 0)}
+            {stat('节点', nodes)}
+            {stat('边', edges)}
+            {stat('整理记录', changes)}
+            {stat('可撤回', rollback)}
+            {stat('待发通知', outbox)}
+            <div className="pa-health-stat pa-health-path">
+              <span>数据目录</span>
+              <strong>{rootPath || '—'}</strong>
+            </div>
+          </div>
+          <p className="pa-health-note">
+            {integrity && !integrityOk
+              ? '数据库完整性检查发现问题，建议先导出备份再排查。'
+              : '完整性正常时，节点与边应随整理持续增长；外键错误应为 0。'}
+          </p>
+          <p className="pa-export-note">
+            {lastExport
+              ? `最近导出：${lastExport.name} · ${formatDate(lastExport.at)}`
+              : '还没有导出记录，建议定期备份。'}
+          </p>
+          <div className="pa-settings-footer">
+            <button type="button" onClick={() => void openDirectory()}>
+              打开数据目录
+            </button>
+            <button type="button" disabled={busy === 'maintain'} onClick={() => void maintain()}>
+              {busy === 'maintain' ? '整理中…' : '立即整理'}
+            </button>
+            <button
+              type="button"
+              className="pa-primary"
+              disabled={busy === 'export'}
+              onClick={() => void exportData()}
+            >
+              {busy === 'export' ? '导出中…' : '导出数据'}
+            </button>
+          </div>
+          <p className="pa-meta">「打开数据目录」会复制路径；受浏览器限制，无法直接打开访达。</p>
+        </>
+      )}
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* First-run onboarding                                                */
+/* ------------------------------------------------------------------ */
+
+function Onboarding({
+  api,
+  root,
+  overview,
+  onFinish,
+  onGoSettings,
+}: {
+  api: Api;
+  root: string;
+  overview: Overview | null;
+  onFinish: () => void;
+  onGoSettings: () => void;
+}) {
+  const notify = useToast();
+  const [step, setStep] = useState(0);
+  const [wechat, setWechat] = useState<WeixinState | null>(null);
+  const [busy, setBusy] = useState('');
+
+  useEffect(() => {
+    if (step !== 2) return;
+    let live = true;
+    api<WeixinState>('weixin.status')
+      .then((value) => {
+        if (live) setWechat(value);
+      })
+      .catch(() => {
+        if (live) setWechat(null);
+      });
+    return () => {
+      live = false;
+    };
+  }, [api, step]);
+
+  const path = overview?.dataRoot || root;
+  const settings = overview?.settings;
+
+  const exportData = async () => {
+    setBusy('export');
+    try {
+      const record = await exportBackup(api);
+      if (!record) return;
+      try {
+        localStorage.setItem('pa.lastExport', JSON.stringify(record));
+      } catch {
+        /* ignore storage failures */
+      }
+      notify(`已导出 ${record.name}`);
+    } catch (err) {
+      notify(message(err), { tone: 'error' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const copyPath = async () => {
+    if (!path) return;
+    const ok = await copyText(path);
+    notify(ok ? '数据目录路径已复制。' : '复制失败。', { tone: ok ? 'info' : 'error' });
+  };
+
+  const goSettings = () => {
+    onFinish();
+    onGoSettings();
+  };
+
+  const wechatText =
+    wechat?.status === 'connected'
+      ? `已连接${wechat.account ? `：${wechat.account}` : ''}`
+      : wechat?.status === 'waiting'
+        ? '等待扫码'
+        : '未连接';
+
+  return (
+    <Modal title="欢迎使用个人助手" onClose={onFinish} wide>
+      <div className="pa-wizard">
+        <div className="pa-steps" aria-hidden="true">
+          {[0, 1, 2].map((value) => (
+            <span key={value} className={cx('pa-step-dot', value <= step && 'pa-on')} />
+          ))}
+        </div>
+        {step === 0 && (
+          <>
+            <h3>① 数据目录与备份</h3>
+            <p>记忆、任务和整理记录都保存在本机数据目录中：</p>
+            <span className="pa-wizard-path">{path || '尚未选择数据目录'}</span>
+            <ul>
+              <li>建议定期导出备份，导出的压缩包可以随时恢复或归档。</li>
+              <li>数据目录可以随时在「设置 → 数据与迁移」中更换。</li>
+              <li>助手不会把数据上传到云端；模型调用只发送当前需要的上下文。</li>
+            </ul>
+            <div className="pa-actions">
+              <button type="button" onClick={() => void copyPath()} disabled={!path}>
+                复制目录路径
+              </button>
+              <button type="button" onClick={() => void exportData()} disabled={busy === 'export'}>
+                {busy === 'export' ? '导出中…' : '立即导出备份'}
+              </button>
+            </div>
+          </>
+        )}
+        {step === 1 && (
+          <>
+            <h3>② 模型与基础助手</h3>
+            <p>
+              当前模型：
+              <strong>{settings?.model || '跟随 DSH 默认模型'}</strong>
+            </p>
+            <p>
+              基础助手：
+              <strong>{settings?.basePreset || '跟随 DSH 默认助手'}</strong>
+            </p>
+            <ul>
+              <li>模型和基础助手决定「立即整理」与对话式助手的表现。</li>
+              <li>可以稍后在「设置 → 助手工作区」中调整。</li>
+            </ul>
+            <div className="pa-actions">
+              <button type="button" onClick={goSettings}>
+                前往助手设置
+              </button>
+            </div>
+          </>
+        )}
+        {step === 2 && (
+          <>
+            <h3>③ 微信连接（可跳过）</h3>
+            <p>
+              状态：<strong>{wechatText}</strong>
+            </p>
+            <ul>
+              <li>连接微信后，可以直接把聊天里的想法转发给助手整理。</li>
+              <li>连接需要扫码，也可以稍后在「设置 → 微信」中完成。</li>
+            </ul>
+            <div className="pa-actions">
+              <button type="button" onClick={goSettings}>
+                前往微信设置
+              </button>
+            </div>
+          </>
+        )}
+        <div className="pa-wizard-actions">
+          <button type="button" onClick={onFinish}>
+            跳过
+          </button>
+          {step > 0 && (
+            <button type="button" onClick={() => setStep((value) => value - 1)}>
+              上一步
+            </button>
+          )}
+          {step < 2 ? (
+            <button
+              type="button"
+              className="pa-primary"
+              onClick={() => setStep((value) => value + 1)}
+            >
+              下一步
+            </button>
+          ) : (
+            <button type="button" className="pa-primary" onClick={onFinish}>
+              完成
+            </button>
+          )}
+        </div>
+      </div>
     </Modal>
   );
 }
@@ -1880,9 +3222,27 @@ interface RecordsProps {
   timezone: string;
   onChange: () => void;
   createSignal: number;
+  wide?: boolean;
+  openRequest?: { kind: Kind; id: string; mode: 'read' | 'edit'; nonce: number } | null;
+  onOpenConsumed?: () => void;
+  createRequest?: { kind: Kind; nonce: number } | null;
+  onCreateConsumed?: () => void;
 }
 
-function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) {
+type TaskSegment = 'all' | 'today' | 'week' | 'overdue' | 'nodue' | 'done';
+
+function Records({
+  api,
+  kind,
+  timezone,
+  onChange,
+  createSignal,
+  wide = false,
+  openRequest = null,
+  onOpenConsumed,
+  createRequest = null,
+  onCreateConsumed,
+}: RecordsProps) {
   const [rows, setRows] = useState<Row[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
@@ -1895,14 +3255,24 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
   const [error, setError] = useState('');
   const [selected, setSelected] = useState<{ row: Row; mode: 'read' | 'edit' } | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [createSeed, setCreateSeed] = useState<Row | undefined>(undefined);
   const [busyKey, setBusyKey] = useState('');
   const [history, setHistory] = useState(false);
+  const [view, setView] = useState<'cards' | 'timeline'>('cards');
+  const [segment, setSegment] = useState<TaskSegment>('all');
+  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [rescheduleOpen, setRescheduleOpen] = useState(false);
+  const [rescheduleValue, setRescheduleValue] = useState('');
+  const [extraDeps, setExtraDeps] = useState<Record<string, Row>>({});
   const notify = useToast();
   const confirm = useConfirm();
   const sequence = useRef(0);
   const label = kindLabel(kind);
   const filterable = kind !== 'project' && kind !== 'tool';
   const projectTitle = projects.find((item) => item.id === project)?.data.title;
+  const isTask = kind === 'task';
+
+  const pageSize = isTask ? 100 : 30;
 
   const refresh = useCallback(async () => {
     const current = sequence.current + 1;
@@ -1912,8 +3282,8 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
         kind,
         query: debouncedQuery,
         projectId: project || undefined,
-        offset,
-        limit: 30,
+        offset: isTask ? 0 : offset,
+        limit: pageSize,
         sort,
       });
       if (current !== sequence.current) return;
@@ -1925,7 +3295,7 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
     } finally {
       if (current === sequence.current) setLoading(false);
     }
-  }, [api, debouncedQuery, kind, offset, project, sort]);
+  }, [api, debouncedQuery, kind, offset, project, sort, isTask, pageSize]);
 
   useEffect(() => {
     setLoading(true);
@@ -1942,17 +3312,63 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
     setOffset(0);
   }, [debouncedQuery, project, sort]);
 
+  useEffect(() => {
+    setChecked(new Set());
+  }, [debouncedQuery, project, sort, segment, view]);
+
   usePolling(refresh, 4000, kind === 'task' || kind === 'tool');
 
   const initialSignal = useRef(createSignal);
   useEffect(() => {
     if (createSignal !== initialSignal.current) {
       initialSignal.current = createSignal;
+      setCreateSeed(undefined);
       setCreateOpen(true);
     }
   }, [createSignal]);
 
   const open = (row: Row, mode: 'read' | 'edit') => setSelected({ row, mode });
+
+  useEffect(() => {
+    if (!openRequest || openRequest.kind !== kind) return;
+    setSelected({
+      row: { id: openRequest.id, revision: 0, data: {} },
+      mode: openRequest.mode,
+    });
+    onOpenConsumed?.();
+  }, [kind, openRequest, onOpenConsumed]);
+
+  useEffect(() => {
+    if (!createRequest || createRequest.kind !== kind) return;
+    setCreateSeed(undefined);
+    setCreateOpen(true);
+    onCreateConsumed?.();
+  }, [createRequest, kind, onCreateConsumed]);
+
+  useEffect(() => {
+    if (!isTask) return;
+    const known = new Set(rows.map((row) => row.id));
+    const missing = Array.from(
+      new Set(rows.flatMap((row) => row.data.dependsOn ?? [])),
+    ).filter((id) => !known.has(id) && !extraDeps[id]);
+    if (missing.length === 0) return;
+    let live = true;
+    void Promise.all(
+      missing.slice(0, 20).map((id) =>
+        command<Row>(api, 'get', { id }).catch(() => null),
+      ),
+    ).then((values) => {
+      if (!live) return;
+      const found: Record<string, Row> = {};
+      for (const value of values) if (value) found[value.id] = value;
+      if (Object.keys(found).length > 0) {
+        setExtraDeps((current) => ({ ...current, ...found }));
+      }
+    });
+    return () => {
+      live = false;
+    };
+  }, [api, rows, isTask, extraDeps]);
 
   const run = async (row: Row) => {
     setBusyKey(`run:${row.id}`);
@@ -1999,6 +3415,154 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
     }
   };
 
+  const todayStart = Date.parse(dayBounds(timezone, 0).start);
+  const todayEnd = Date.parse(dayBounds(timezone, 0).end);
+  const tomorrowStart = Date.parse(dayBounds(timezone, 1).start);
+  const weekday = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone || undefined,
+    weekday: 'short',
+  }).format(new Date());
+  const weekdayNumber =
+    { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[weekday] ?? 1;
+  const daysToNextMonday = (8 - (weekdayNumber === 0 ? 7 : weekdayNumber)) % 7 || 7;
+  const weekEnd = Date.parse(dayBounds(timezone, daysToNextMonday).start);
+
+  const isDone = (row: Row) => row.data.status === 'completed';
+  const isInactive = (row: Row) =>
+    ['completed', 'cancelled', 'failed'].includes(row.data.status ?? '');
+
+  const inSegment = (row: Row, value: TaskSegment) => {
+    if (value === 'all') return true;
+    if (value === 'done') return isDone(row);
+    if (isInactive(row)) return false;
+    const due = row.data.dueAt ? Date.parse(row.data.dueAt) : NaN;
+    if (value === 'nodue') return !Number.isFinite(due);
+    if (!Number.isFinite(due)) return false;
+    if (value === 'today') return due >= todayStart && due < todayEnd;
+    if (value === 'week') return due >= tomorrowStart && due < weekEnd;
+    return due < todayStart;
+  };
+
+  const visibleRows = isTask ? rows.filter((row) => inSegment(row, segment)) : rows;
+  const segmentItems: Array<{ id: TaskSegment; label: string; count: number }> = [
+    { id: 'all', label: '全部', count: rows.length },
+    { id: 'today', label: '今天', count: rows.filter((row) => inSegment(row, 'today')).length },
+    { id: 'week', label: '本周', count: rows.filter((row) => inSegment(row, 'week')).length },
+    { id: 'overdue', label: '逾期', count: rows.filter((row) => inSegment(row, 'overdue')).length },
+    { id: 'nodue', label: '无期限', count: rows.filter((row) => inSegment(row, 'nodue')).length },
+    { id: 'done', label: '已完成', count: rows.filter((row) => inSegment(row, 'done')).length },
+  ];
+  const allChecked =
+    visibleRows.length > 0 && visibleRows.every((row) => checked.has(row.id));
+
+  const toggleChecked = (id: string) => {
+    setChecked((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const toggleAll = () => {
+    setChecked((current) => {
+      const next = new Set(current);
+      if (allChecked) visibleRows.forEach((row) => next.delete(row.id));
+      else visibleRows.forEach((row) => next.add(row.id));
+      return next;
+    });
+  };
+
+  const selectedRows = rows.filter((row) => checked.has(row.id));
+
+  const bulkComplete = async () => {
+    if (selectedRows.length === 0) return;
+    setBusyKey('bulk');
+    try {
+      await Promise.all(
+        selectedRows.map((row) =>
+          command(api, 'taskEdit', {
+            id: row.id,
+            revision: row.revision,
+            patch: { status: 'completed' },
+          }),
+        ),
+      );
+      notify(`已完成 ${selectedRows.length} 个任务`);
+      setChecked(new Set());
+      await refresh();
+      onChange();
+    } catch (errorValue) {
+      const mapped = message(errorValue);
+      setError(mapped);
+      notify(mapped, { tone: 'error' });
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const bulkReschedule = async () => {
+    if (selectedRows.length === 0) return;
+    setBusyKey('bulk');
+    try {
+      const dueAt = rescheduleValue ? fromLocal(rescheduleValue, timezone) : null;
+      await Promise.all(
+        selectedRows.map((row) =>
+          command(api, 'taskEdit', {
+            id: row.id,
+            revision: row.revision,
+            patch: { dueAt },
+          }),
+        ),
+      );
+      notify(dueAt ? `已改期 ${selectedRows.length} 个任务` : '已清除截止时间');
+      setRescheduleOpen(false);
+      setChecked(new Set());
+      await refresh();
+      onChange();
+    } catch (errorValue) {
+      const mapped = message(errorValue);
+      setError(mapped);
+      notify(mapped, { tone: 'error' });
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const bulkDelete = async () => {
+    if (selectedRows.length === 0) return;
+    const ok = await confirm({
+      title: `删除 ${selectedRows.length} 个任务？`,
+      body: '删除后无法恢复，相关的前置依赖与关联也会被移除。',
+      confirmLabel: '删除',
+    });
+    if (!ok) return;
+    setBusyKey('bulk');
+    try {
+      await Promise.all(
+        selectedRows.map((row) =>
+          command(api, 'remove', { id: row.id, revision: row.revision }),
+        ),
+      );
+      notify(`已删除 ${selectedRows.length} 个任务`);
+      setChecked(new Set());
+      await refresh();
+      onChange();
+    } catch (errorValue) {
+      const mapped = message(errorValue);
+      setError(mapped);
+      notify(mapped, { tone: 'error' });
+    } finally {
+      setBusyKey('');
+    }
+  };
+
+  const dependency = (id: string) => rows.find((row) => row.id === id) ?? extraDeps[id];
+  const quickCreate = (taskKind: 'task', projectId: string) => {
+    setSelected(null);
+    setCreateSeed({ id: '', revision: 0, data: { projectId } });
+    setCreateOpen(true);
+  };
+
   if (history) {
     return (
       <>
@@ -2014,6 +3578,149 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
       </>
     );
   }
+
+  const list = (
+    <>
+      {error && <div role="alert" className="pa-error">{error}</div>}
+      {loading ? (
+        <SkeletonCards />
+      ) : visibleRows.length === 0 ? (
+        <EmptyState
+          text={
+            debouncedQuery || project
+              ? `没有找到匹配的${label}`
+              : isTask && segment !== 'all'
+                ? `没有「${segmentItems.find((item) => item.id === segment)?.label}」的任务`
+                : `还没有${label}`
+          }
+          actionLabel={debouncedQuery || project ? '清除筛选' : `新建${label}`}
+          onAction={() => {
+            if (debouncedQuery || project) {
+              setQuery('');
+              setProject('');
+              setOffset(0);
+            } else {
+              setCreateSeed(undefined);
+              setCreateOpen(true);
+            }
+          }}
+        />
+      ) : view === 'timeline' && kind === 'memory' ? (
+        <MemoryTimeline
+          rows={visibleRows}
+          projects={projects}
+          timezone={timezone}
+          onOpen={(row) => open(row, 'read')}
+        />
+      ) : (
+        <div className={cx('pa-records', `pa-records-${kind}`)}>
+          {visibleRows.map((row) => {
+            const dependencies = row.data.dependsOn ?? [];
+            return (
+              <article
+                className={cx('pa-card', isTask && checked.has(row.id) && 'pa-card-checked')}
+                key={row.id}
+              >
+                <div className="pa-card-main">
+                  {isTask && (
+                    <label className="pa-check" onClick={(event) => event.stopPropagation()}>
+                      <input
+                        type="checkbox"
+                        aria-label={`选择 ${row.data.title ?? '任务'}`}
+                        checked={checked.has(row.id)}
+                        onChange={() => toggleChecked(row.id)}
+                      />
+                    </label>
+                  )}
+                  <div className="pa-card-head">
+                    <button
+                      type="button"
+                      className="pa-title"
+                      onClick={() => open(row, 'read')}
+                    >
+                      {row.data.title}
+                    </button>
+                    <span className="pa-tag">{statusText(kind, row.data)}</span>
+                  </div>
+                </div>
+                {kind === 'memory' && (row.data.observations ?? []).length > 0 && (
+                  <div className="pa-meta">
+                    {formatDate(row.data.observations?.at(-1)?.at, timezone)}
+                  </div>
+                )}
+                {bodyTextOf(kind, row.data) && (
+                  <p className="pa-clamp">{bodyTextOf(kind, row.data)}</p>
+                )}
+                <div className="pa-tags">
+                  {(row.data.domains ?? []).map((value) => (
+                    <span className="pa-tag" key={value}>{value}</span>
+                  ))}
+                  {row.data.pinned && <span className="pa-tag">固定</span>}
+                  {row.data.important && <span className="pa-tag">重要</span>}
+                  {row.data.urgent && <span className="pa-tag pa-warm">紧急</span>}
+                  {row.data.derivedDirty && <span className="pa-tag">待整理</span>}
+                  {row.data.projectId && (
+                    <span className="pa-tag">
+                      {projects.find((item) => item.id === row.data.projectId)?.data.title ??
+                        '项目'}
+                    </span>
+                  )}
+                </div>
+                {dependencies.length > 0 && (
+                  <div className="pa-dep-row">
+                    <span>前置：</span>
+                    {dependencies.map((id) => {
+                      const dep = dependency(id);
+                      const done = dep?.data.status === 'completed';
+                      return (
+                        <span
+                          key={id}
+                          className={cx('pa-dep', done && 'pa-dep-done')}
+                          title={dep?.data.title ?? id}
+                        >
+                          {dep?.data.title ?? id.slice(0, 8)}
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+                {row.data.dueAt && (
+                  <div className="pa-meta">{formatDate(row.data.dueAt, timezone)}</div>
+                )}
+                <footer>
+                  <button type="button" onClick={() => open(row, 'read')}>查看</button>
+                  {(kind === 'task' || kind === 'tool') && (
+                    <button
+                      type="button"
+                      disabled={busyKey !== '' || (kind === 'tool' && !row.data.activeVersion)}
+                      onClick={() => void run(row)}
+                    >
+                      {busyKey === `run:${row.id}` ? '处理中…' : '执行'}
+                    </button>
+                  )}
+                  {kind === 'tool' && row.data.pendingVersion && (
+                    <button
+                      type="button"
+                      disabled={busyKey !== ''}
+                      onClick={() => void activate(row)}
+                    >
+                      {busyKey === `activate:${row.id}` ? '处理中…' : '启用版本'}
+                    </button>
+                  )}
+                </footer>
+              </article>
+            );
+          })}
+        </div>
+      )}
+      {!loading && !isTask && rows.length > 0 && (
+        <Pager offset={offset} total={total} onPage={setOffset} />
+      )}
+      {!loading && isTask && total > rows.length && (
+        <p className="pa-meta">当前显示最近 {rows.length} 条，共 {total} 条。</p>
+      )}
+    </>
+  );
 
   return (
     <>
@@ -2045,12 +3752,31 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
           <button
             type="button"
             className="pa-primary"
-            onClick={() => setCreateOpen(true)}
+            onClick={() => {
+              setCreateSeed(undefined);
+              setCreateOpen(true);
+            }}
           >
             新建{label}
           </button>
         </div>
       </div>
+      {isTask && (
+        <div className="pa-segments" role="group" aria-label="任务分组">
+          {segmentItems.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={cx(segment === item.id && 'pa-selected')}
+              aria-pressed={segment === item.id}
+              onClick={() => setSegment(item.id)}
+            >
+              {item.label}
+              <span className="pa-segment-count">{item.count}</span>
+            </button>
+          ))}
+        </div>
+      )}
       <div className="pa-toolbar pa-filters">
         <div className="pa-search">
           <input
@@ -2067,6 +3793,26 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
             <span className="pa-search-state">搜索中…</span>
           )}
         </div>
+        {kind === 'memory' && (
+          <div className="pa-segments" role="group" aria-label="记忆视图">
+            <button
+              type="button"
+              className={cx(view === 'cards' && 'pa-selected')}
+              aria-pressed={view === 'cards'}
+              onClick={() => setView('cards')}
+            >
+              卡片
+            </button>
+            <button
+              type="button"
+              className={cx(view === 'timeline' && 'pa-selected')}
+              aria-pressed={view === 'timeline'}
+              onClick={() => setView('timeline')}
+            >
+              时间线
+            </button>
+          </div>
+        )}
         <select
           aria-label="排序"
           value={sort}
@@ -2092,86 +3838,80 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
           </select>
         )}
       </div>
-      {error && <div role="alert" className="pa-error">{error}</div>}
-      {loading ? (
-        <SkeletonCards />
-      ) : rows.length === 0 ? (
-        <EmptyState
-          text={debouncedQuery || project ? `没有找到匹配的${label}` : `还没有${label}`}
-          actionLabel={debouncedQuery || project ? '清除筛选' : `新建${label}`}
-          onAction={() => {
-            if (debouncedQuery || project) {
-              setQuery('');
-              setProject('');
-              setOffset(0);
-            } else {
-              setCreateOpen(true);
-            }
-          }}
-        />
-      ) : (
-        <div className={cx('pa-records', `pa-records-${kind}`)}>
-          {rows.map((row) => (
-            <article className="pa-card" key={row.id}>
-              <div className="pa-card-head">
-                <button
-                  type="button"
-                  className="pa-title"
-                  onClick={() => open(row, 'read')}
-                >
-                  {row.data.title}
-                </button>
-                <span className="pa-tag">{statusText(kind, row.data)}</span>
-              </div>
-              {kind === 'memory' && (row.data.observations ?? []).length > 0 && (
-                <div className="pa-meta">
-                  {formatDate(row.data.observations?.at(-1)?.at, timezone)}
-                </div>
-              )}
-              {bodyTextOf(kind, row.data) && (
-                <p className="pa-clamp">{bodyTextOf(kind, row.data)}</p>
-              )}
-              <div className="pa-tags">
-                {(row.data.domains ?? []).map((value) => (
-                  <span className="pa-tag" key={value}>{value}</span>
-                ))}
-                {row.data.pinned && <span className="pa-tag">固定</span>}
-                {row.data.important && <span className="pa-tag">重要</span>}
-                {row.data.urgent && <span className="pa-tag pa-warm">紧急</span>}
-                {row.data.derivedDirty && <span className="pa-tag">待整理</span>}
-              </div>
-              {row.data.dueAt && (
-                <div className="pa-meta">{formatDate(row.data.dueAt, timezone)}</div>
-              )}
-              <footer>
-                <button type="button" onClick={() => open(row, 'read')}>查看</button>
-                {(kind === 'task' || kind === 'tool') && (
-                  <button
-                    type="button"
-                    disabled={busyKey !== '' || (kind === 'tool' && !row.data.activeVersion)}
-                    onClick={() => void run(row)}
-                  >
-                    {busyKey === `run:${row.id}` ? '处理中…' : '执行'}
-                  </button>
-                )}
-                {kind === 'tool' && row.data.pendingVersion && (
-                  <button
-                    type="button"
-                    disabled={busyKey !== ''}
-                    onClick={() => void activate(row)}
-                  >
-                    {busyKey === `activate:${row.id}` ? '处理中…' : '启用版本'}
-                  </button>
-                )}
-              </footer>
-            </article>
-          ))}
+      {isTask && (
+        <div className="pa-bulkbar">
+          <label className="pa-check">
+            <input
+              type="checkbox"
+              checked={allChecked}
+              onChange={toggleAll}
+              aria-label="全选当前任务"
+            />
+            全选
+          </label>
+          <strong>已选 {checked.size} 项</strong>
+          <button
+            type="button"
+            disabled={checked.size === 0 || busyKey !== ''}
+            onClick={() => void bulkComplete()}
+          >
+            批量完成
+          </button>
+          <button
+            type="button"
+            disabled={checked.size === 0 || busyKey !== ''}
+            onClick={() => {
+              setRescheduleValue(localInput(Date.now() + 86400000, timezone));
+              setRescheduleOpen(true);
+            }}
+          >
+            批量改期
+          </button>
+          <button
+            type="button"
+            className="pa-danger"
+            disabled={checked.size === 0 || busyKey !== ''}
+            onClick={() => void bulkDelete()}
+          >
+            批量删除
+          </button>
+          <button
+            type="button"
+            disabled={checked.size === 0}
+            onClick={() => setChecked(new Set())}
+          >
+            清除
+          </button>
         </div>
       )}
-      {!loading && rows.length > 0 && (
-        <Pager offset={offset} total={total} onPage={setOffset} />
+      {wide ? (
+        <div className="pa-split">
+          <div className="pa-split-list">{list}</div>
+          {selected ? (
+            <RecordDialog
+              key={`${selected.row.id}:${selected.mode}`}
+              inline
+              api={api}
+              kind={kind}
+              seed={selected.row}
+              initialMode={selected.mode}
+              projects={projects}
+              timezone={timezone}
+              onClose={() => setSelected(null)}
+              onChanged={() => {
+                void refresh();
+                onChange();
+              }}
+              onQuickCreate={quickCreate}
+            />
+          ) : (
+            <div className="pa-split-empty">从左侧选择一条记录，在这里查看详情。</div>
+          )}
+        </div>
+      ) : (
+        list
       )}
-      {selected && (
+      {!wide && selected && (
         <RecordDialog
           key={`${selected.row.id}:${selected.mode}`}
           api={api}
@@ -2185,14 +3925,16 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
             void refresh();
             onChange();
           }}
+          onQuickCreate={quickCreate}
         />
       )}
       {createOpen && (
         <RecordDialog
-          key="create"
+          key={`create:${createSeed?.data.projectId ?? ''}`}
           api={api}
           kind={kind}
           create
+          seed={createSeed}
           projects={projects}
           timezone={timezone}
           onClose={() => setCreateOpen(false)}
@@ -2200,15 +3942,39 @@ function Records({ api, kind, timezone, onChange, createSignal }: RecordsProps) 
             void refresh();
             onChange();
           }}
+          onQuickCreate={quickCreate}
         />
+      )}
+      {rescheduleOpen && (
+        <Modal title="批量改期" onClose={() => setRescheduleOpen(false)}>
+          <div className="pa-dialog-body">
+            <Field label="新的截止时间">
+              <input
+                type="datetime-local"
+                value={rescheduleValue}
+                onChange={(event) => setRescheduleValue(event.target.value)}
+              />
+            </Field>
+            <p className="pa-hint">
+              将修改选中的 {checked.size} 个任务；留空并确认可清除截止时间。
+            </p>
+          </div>
+          <footer className="pa-dialog-footer">
+            <button type="button" onClick={() => setRescheduleOpen(false)}>取消</button>
+            <button
+              type="button"
+              className="pa-primary"
+              disabled={busyKey === 'bulk'}
+              onClick={() => void bulkReschedule()}
+            >
+              {busyKey === 'bulk' ? '处理中…' : '确认改期'}
+            </button>
+          </footer>
+        </Modal>
       )}
     </>
   );
 }
-
-/* ------------------------------------------------------------------ */
-/* Run history and tool versions                                       */
-/* ------------------------------------------------------------------ */
 
 function RunHistory({
   api,
@@ -2362,9 +4128,18 @@ interface CalendarProps {
   timezone: string;
   onChange: () => void;
   createSignal: number;
+  openRequest?: { id: string; nonce: number } | null;
+  onOpenConsumed?: () => void;
 }
 
-function Calendar({ api, timezone, onChange, createSignal }: CalendarProps) {
+function Calendar({
+  api,
+  timezone,
+  onChange,
+  createSignal,
+  openRequest = null,
+  onOpenConsumed,
+}: CalendarProps) {
   const [cursor, setCursor] = useState(() => new Date());
   const [rows, setRows] = useState<Row[]>([]);
   const [view, setView] = useState<'month' | 'week' | 'agenda'>('month');
@@ -2410,6 +4185,23 @@ function Calendar({ api, timezone, onChange, createSignal }: CalendarProps) {
     const form = makeEventForm(row, day, timezone);
     setEditor({ form, initial: form });
   };
+
+  useEffect(() => {
+    if (!openRequest) return;
+    let live = true;
+    command<Row>(api, 'get', { id: openRequest.id })
+      .then((row) => {
+        if (!live) return;
+        open(row);
+        onOpenConsumed?.();
+      })
+      .catch((errorValue) => {
+        if (live) setError(message(errorValue));
+      });
+    return () => {
+      live = false;
+    };
+  }, [api, openRequest, onOpenConsumed]);
 
   const initialSignal = useRef(createSignal);
   useEffect(() => {
@@ -3674,6 +5466,7 @@ const SETTINGS_SECTIONS: Array<{ id: string; label: string }> = [
   { id: 'workspace', label: '助手工作区' },
   { id: 'memory', label: '记忆与维护' },
   { id: 'data', label: '数据与迁移' },
+  { id: 'appearance', label: '外观与引导' },
   { id: 'weixin', label: '微信' },
 ];
 
@@ -3681,10 +5474,18 @@ function Settings({
   api,
   onChange,
   onBack,
+  density,
+  onDensityChange,
+  onShowOnboarding,
+  onShowHelp,
 }: {
   api: Api;
   onChange: () => void;
   onBack: () => void;
+  density: Density;
+  onDensityChange: (value: Density) => void;
+  onShowOnboarding: () => void;
+  onShowHelp: () => void;
 }) {
   const [settings, setSettings] = useState<AssistantSettings | null>(null);
   const [options, setOptions] = useState<SettingsOptions | null>(null);
@@ -4020,6 +5821,7 @@ function Settings({
                 </button>
               </div>
             </section>
+            <DataHealth api={api} root={root} />
             <section className="pa-settings-card">
               <header><h3>导出备份</h3></header>
               <div className="pa-settings-fields">
@@ -4045,6 +5847,40 @@ function Settings({
               </div>
             </section>
           </>
+        )}
+        {section === 'appearance' && (
+          <section className="pa-settings-card">
+            <header><h3>外观与引导</h3></header>
+            <div className="pa-settings-fields">
+              <Field label="界面密度">
+                <div className="pa-segments" role="group" aria-label="界面密度">
+                  <button
+                    type="button"
+                    className={cx(density === 'standard' && 'pa-selected')}
+                    aria-pressed={density === 'standard'}
+                    onClick={() => onDensityChange('standard')}
+                  >
+                    标准
+                  </button>
+                  <button
+                    type="button"
+                    className={cx(density === 'compact' && 'pa-selected')}
+                    aria-pressed={density === 'compact'}
+                    onClick={() => onDensityChange('compact')}
+                  >
+                    紧凑
+                  </button>
+                </div>
+              </Field>
+              <p className="pa-hint">
+                紧凑模式会收紧列表、卡片与详情的行高和间距，适合在信息密集时使用；选择会保存在本机。
+              </p>
+              <div className="pa-actions">
+                <button type="button" onClick={onShowOnboarding}>重新查看引导</button>
+                <button type="button" onClick={onShowHelp}>快捷键帮助</button>
+              </div>
+            </div>
+          </section>
         )}
         {section === 'weixin' && (
           <section className="pa-settings-card">
@@ -4211,6 +6047,20 @@ function Settings({
 /* App shell                                                           */
 /* ------------------------------------------------------------------ */
 
+const BOTTOM_TABS: Array<{ id: TabId; label: string; icon: string }> = [
+  { id: 'today', label: '今天', icon: '☀' },
+  { id: 'memory', label: '记忆', icon: '◈' },
+  { id: 'task', label: '任务', icon: '✓' },
+  { id: 'calendar', label: '日历', icon: '▦' },
+];
+
+const MORE_TABS: Array<{ id: TabId; label: string; icon: string }> = [
+  { id: 'project', label: '项目', icon: '▤' },
+  { id: 'tool', label: '工具', icon: '⚒' },
+  { id: 'inbox', label: '收件箱', icon: '✉' },
+  { id: 'settings', label: '设置', icon: '⚙' },
+];
+
 function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
   const [tab, setTab] = useState<TabId>(() =>
     [...NAV_TABS.map((item) => item.id), 'settings'].includes(initialTab as TabId)
@@ -4238,6 +6088,21 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
   });
   const [error, setError] = useState('');
   const [createSignal, setCreateSignal] = useState(0);
+  const [createRequest, setCreateRequest] = useState<{ kind: Kind; nonce: number } | null>(null);
+  const [focusRequest, setFocusRequest] = useState<
+    { kind: Kind; id: string; mode: 'read' | 'edit'; nonce: number } | null
+  >(null);
+  const [eventRequest, setEventRequest] = useState<{ id: string; nonce: number } | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [entityId, setEntityId] = useState<string | null>(null);
+  const [onboarding, setOnboarding] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [density, setDensity] = useState<Density>(() => readDensity());
+  const [wide, setWide] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(min-width: 1200px)').matches,
+  );
+  const notify = useToast();
   const root = useRef<HTMLElement | null>(null);
   const refresh = useCallback(() => {
     void command<Overview>(api, 'overview')
@@ -4250,7 +6115,119 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
   usePolling(refresh, 10000);
 
   useEffect(() => {
+    document.documentElement.dataset.paDensity = density;
+    try {
+      localStorage.setItem('pa.density', density);
+    } catch {
+      // Local storage can be unavailable in private contexts.
+    }
+  }, [density]);
+
+  useEffect(() => {
+    const query = window.matchMedia('(min-width: 1200px)');
+    const onChange = () => setWide(query.matches);
+    onChange();
+    query.addEventListener?.('change', onChange);
+    return () => query.removeEventListener?.('change', onChange);
+  }, []);
+
+  useEffect(() => {
+    if (!overview.dataRoot) return;
+    let onboarded = false;
+    try {
+      onboarded = localStorage.getItem('pa.onboarded') === '1';
+    } catch {
+      // Ignore unavailable storage.
+    }
+    if (!onboarded) setOnboarding(true);
+  }, [overview.dataRoot]);
+
+  const finishOnboarding = () => {
+    try {
+      localStorage.setItem('pa.onboarded', '1');
+    } catch {
+      // Ignore unavailable storage.
+    }
+    setOnboarding(false);
+  };
+
+  const openSearchItem = (item: SearchItem) => {
+    if (item.kind === 'entity') {
+      setEntityId(item.id);
+      return;
+    }
+    if (item.kind === 'event') {
+      setTab('calendar');
+      setEventRequest({ id: item.id, nonce: Date.now() });
+      return;
+    }
+    setTab(item.kind as TabId);
+    setFocusRequest({
+      kind: item.kind,
+      id: item.id,
+      mode: item.kind === 'task' ? 'edit' : 'read',
+      nonce: Date.now(),
+    });
+  };
+
+  const requestCreate = (kind: Kind) => {
+    if (kind === 'memory' || kind === 'project' || kind === 'task' || kind === 'tool') {
+      setCreateRequest({ kind, nonce: Date.now() });
+    }
+  };
+
+  const createForCurrentTab = () => {
+    if (tab === 'memory' || tab === 'project' || tab === 'task' || tab === 'tool') {
+      requestCreate(tab);
+    } else if (tab === 'calendar' || tab === 'today') {
+      setCreateSignal((value) => value + 1);
+    } else {
+      setTab('memory');
+      setCreateRequest({ kind: 'memory', nonce: Date.now() });
+    }
+  };
+
+  const maintain = async () => {
+    try {
+      await api('maintenance.run', { requestId: crypto.randomUUID() });
+      notify('已开始整理，稍后可到收件箱查看结果');
+      refresh();
+    } catch (errorValue) {
+      notify(message(errorValue), { tone: 'error' });
+    }
+  };
+
+  const exportData = async () => {
+    try {
+      const info = await exportBackup(api);
+      if (!info) return;
+      try {
+        localStorage.setItem('pa.lastExport', JSON.stringify(info));
+      } catch {
+        // Ignore unavailable storage.
+      }
+      notify(`已导出：${info.name}`);
+    } catch (errorValue) {
+      notify(message(errorValue), { tone: 'error' });
+    }
+  };
+
+  const newMemory = () => {
+    setTab('memory');
+    setCreateRequest({ kind: 'memory', nonce: Date.now() });
+  };
+
+  useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (
+        (event.metaKey || event.ctrlKey) &&
+        !event.altKey &&
+        event.key.toLowerCase() === 'k'
+      ) {
+        event.preventDefault();
+        setPaletteOpen(true);
+        return;
+      }
       if (event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return;
       if (document.querySelector('.pa-modal')) return;
       const target = event.target;
@@ -4270,14 +6247,37 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
           ?.focus();
       } else if (event.key === 'n') {
         event.preventDefault();
-        setCreateSignal((value) => value + 1);
+        createForCurrentTab();
+      } else if (event.key === '?') {
+        event.preventDefault();
+        setHelpOpen(true);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  });
+
+  useEffect(() => {
+    if (!moreOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMoreOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [moreOpen]);
 
   const timezone = overview.settings.timezone || 'Asia/Shanghai';
+  const recordProps = {
+    api,
+    timezone,
+    onChange: refresh,
+    createSignal,
+    wide,
+    openRequest: focusRequest,
+    onOpenConsumed: () => setFocusRequest(null),
+    createRequest,
+    onCreateConsumed: () => setCreateRequest(null),
+  };
   return (
     <main
       className={cx('pa-app', Boolean(window.__DSH_DIRECTORY_PICKER__) && 'pa-desktop')}
@@ -4289,6 +6289,17 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
           <h1>个人助手</h1>
         </div>
         <div className="pa-header-actions">
+          <button
+            type="button"
+            className="pa-search-button"
+            aria-label="搜索与命令"
+            title="搜索与命令（⌘K）"
+            onClick={() => setPaletteOpen(true)}
+          >
+            <span aria-hidden="true">⌕</span>
+            <span className="pa-search-button-label">搜索</span>
+            <span className="pa-kbd">⌘K</span>
+          </button>
           <span className="pa-meta">{timezone}</span>
           <button
             type="button"
@@ -4323,7 +6334,7 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
       </nav>
       <div className="pa-content">
         <div
-          className="pa-page"
+          className={cx('pa-page', wide && 'pa-page-wide')}
           id={`pa-panel-${tab}`}
           role="tabpanel"
           aria-labelledby={`pa-tab-${tab}`}
@@ -4338,29 +6349,132 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
               createSignal={createSignal}
             />
           )}
-          {tab === 'memory' && (
-            <Records key="memory" api={api} kind="memory" timezone={timezone} onChange={refresh} createSignal={createSignal} />
-          )}
-          {tab === 'project' && (
-            <Records key="project" api={api} kind="project" timezone={timezone} onChange={refresh} createSignal={createSignal} />
-          )}
-          {tab === 'task' && (
-            <Records key="task" api={api} kind="task" timezone={timezone} onChange={refresh} createSignal={createSignal} />
-          )}
-          {tab === 'tool' && (
-            <Records key="tool" api={api} kind="tool" timezone={timezone} onChange={refresh} createSignal={createSignal} />
-          )}
+          {tab === 'memory' && <Records key="memory" kind="memory" {...recordProps} />}
+          {tab === 'project' && <Records key="project" kind="project" {...recordProps} />}
+          {tab === 'task' && <Records key="task" kind="task" {...recordProps} />}
+          {tab === 'tool' && <Records key="tool" kind="tool" {...recordProps} />}
           {tab === 'calendar' && (
-            <Calendar api={api} timezone={timezone} onChange={refresh} createSignal={createSignal} />
+            <Calendar
+              api={api}
+              timezone={timezone}
+              onChange={refresh}
+              createSignal={createSignal}
+              openRequest={eventRequest}
+              onOpenConsumed={() => setEventRequest(null)}
+            />
           )}
           {tab === 'inbox' && (
             <Inbox api={api} timezone={timezone} onChange={refresh} />
           )}
           {tab === 'settings' && (
-            <Settings api={api} onChange={refresh} onBack={() => setTab('today')} />
+            <Settings
+              api={api}
+              onChange={refresh}
+              onBack={() => setTab('today')}
+              density={density}
+              onDensityChange={setDensity}
+              onShowOnboarding={() => setOnboarding(true)}
+              onShowHelp={() => setHelpOpen(true)}
+            />
           )}
         </div>
       </div>
+      <nav className="pa-bottom-nav" aria-label="移动端导航">
+        {BOTTOM_TABS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            className={tab === item.id ? 'pa-selected' : ''}
+            aria-current={tab === item.id ? 'page' : undefined}
+            onClick={() => {
+              setTab(item.id);
+              setMoreOpen(false);
+            }}
+          >
+            <span aria-hidden="true">{item.icon}</span>
+            {item.label}
+          </button>
+        ))}
+        <button
+          type="button"
+          className={cx(['project', 'tool', 'inbox', 'settings'].includes(tab) && 'pa-selected')}
+          aria-expanded={moreOpen}
+          onClick={() => setMoreOpen((value) => !value)}
+        >
+          <span aria-hidden="true">⋯</span>
+          更多
+          {overview.unread > 0 && <span className="pa-badge">{overview.unread}</span>}
+        </button>
+      </nav>
+      {moreOpen && (
+        <div
+          className="pa-sheet-backdrop"
+          role="presentation"
+          onClick={() => setMoreOpen(false)}
+        >
+          <div
+            className="pa-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-label="更多"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="pa-sheet-handle" aria-hidden="true" />
+            <h3>更多</h3>
+            <nav>
+              {MORE_TABS.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={tab === item.id ? 'pa-selected' : ''}
+                  onClick={() => {
+                    setTab(item.id);
+                    setMoreOpen(false);
+                  }}
+                >
+                  <span aria-hidden="true">{item.icon}</span> {item.label}
+                  {item.id === 'inbox' && overview.unread > 0 && (
+                    <span className="pa-badge">{overview.unread}</span>
+                  )}
+                </button>
+              ))}
+            </nav>
+            <button type="button" onClick={() => setMoreOpen(false)}>关闭</button>
+          </div>
+        </div>
+      )}
+      {paletteOpen && (
+        <CommandPalette
+          api={api}
+          density={density}
+          onClose={() => setPaletteOpen(false)}
+          onNavigate={(next) => setTab(next)}
+          onOpenItem={openSearchItem}
+          onCreateMemory={newMemory}
+          onMaintain={() => void maintain()}
+          onExport={() => void exportData()}
+          onToggleDensity={() =>
+            setDensity((value) => (value === 'compact' ? 'standard' : 'compact'))
+          }
+          onHelp={() => setHelpOpen(true)}
+        />
+      )}
+      {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
+      {entityId && (
+        <EntityPeek api={api} id={entityId} onClose={() => setEntityId(null)} />
+      )}
+      {onboarding && (
+        <Onboarding
+          api={api}
+          root={overview.dataRoot}
+          overview={overview}
+          onFinish={finishOnboarding}
+          onGoSettings={() => {
+            setOnboarding(false);
+            setTab('settings');
+          }}
+        />
+      )}
     </main>
   );
 }

@@ -77,6 +77,7 @@ export class Store extends Base {
     switch(command){
       case'overview':return{counts:Object.fromEntries(this.db.prepare('SELECT kind,COUNT(*) AS n FROM nodes GROUP BY kind').all().map((r:any)=>[r.kind,r.n])),unread:Number(this.db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get().n),dataRoot:this.directory.root,settings:this.settings};
       case'list':return this.list(a);
+      case'searchAll':return this.searchAll(a);
       case'get':return this.node(a.id);
       case'relations':this.node(a.id);return this.all('edges').filter((e:any)=>e.data.from===a.id||e.data.to===a.id).map((e:any)=>({id:e.id,kind:e.data.kind,direction:e.data.from===a.id?'out':'in',object:this.node(e.data.from===a.id?e.data.to:e.data.from)}));
       case'settingsGet':return this.settings;
@@ -137,6 +138,14 @@ export class Store extends Base {
     const total=Number(this.db.prepare(sql.replace('SELECT id','SELECT COUNT(*) AS n')).get(...params).n);
     const order=a.sort==='title'?"json_extract(data,'$.title') COLLATE NOCASE ASC,id":a.sort==='created'?"COALESCE(json_extract(data,'$.createdAt'),0) DESC,id":"COALESCE(CASE WHEN kind='memory' THEN json_extract(data,'$.observations[#-1].at') END,json_extract(data,'$.createdAt'),0) DESC,id";
     const rows=this.db.prepare(sql+' ORDER BY '+order+' LIMIT ? OFFSET ?').all(...params,a.limit,a.offset).map((r:any)=>this.node(r.id));return{items:rows,total,offset:a.offset};
+  }
+  searchAll(a:any){
+    const raw=String(a.query??'').trim();if(!raw)return{query:'',groups:{},total:0};
+    const like='%'+raw.replace(/[\\%_]/g,(s:string)=>'\\'+s)+'%',limit=Math.max(1,Math.min(50,a.limit??20));
+    const rows:any[]=this.db.prepare("SELECT kind,id,json_extract(data,'$.title') AS title,json_extract(data,'$.name') AS name,json_extract(data,'$.body') AS body,json_extract(data,'$.goal') AS goal,json_extract(data,'$.description') AS description,COALESCE(json_extract(data,'$.createdAt'),0) AS createdAt FROM nodes WHERE kind IN ('memory','project','task','event','tool','entity') AND (json_extract(data,'$.title') LIKE ? ESCAPE '\\' OR json_extract(data,'$.name') LIKE ? ESCAPE '\\' OR json_extract(data,'$.body') LIKE ? ESCAPE '\\' OR json_extract(data,'$.goal') LIKE ? ESCAPE '\\' OR json_extract(data,'$.description') LIKE ? ESCAPE '\\') ORDER BY createdAt DESC LIMIT ?").all(like,like,like,like,like,limit*4);
+    const groups:Record<string,any[]>={};let total=0;
+    for(const row of rows){const bucket=groups[row.kind]??(groups[row.kind]=[]);if(bucket.length>=5)continue;bucket.push({id:row.id,kind:row.kind,title:row.title??row.name??'',snippet:String(row.body??row.goal??row.description??'').slice(0,120)});total++;}
+    return{query:raw,groups,total};
   }
   create(kind:string,data:any,key:string){return this.command(key,{action:'create',kind,data},()=>{const id=randomUUID();const change=this.journal(kind+'.created',[{id,kind,data:{...clone(data),owner:this.owner(),...(kind==='event'?{uid:randomUUID()}:{}),createdAt:data.createdAt??this.now()}}]);return{id,revision:this.version('nodes',id),...change};});}
   edit(id:string,kind:string,patch:any,revision:number,key:string,manual=false,extra:any[]=[]){return this.command(key,{action:'edit',id,kind,patch,revision},()=>{
