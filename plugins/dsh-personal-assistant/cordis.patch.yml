@@ -1,0 +1,4 @@
+- insert:
+    - id: personal-assistant
+      name: dsh-personal-assistant
+      config: {}

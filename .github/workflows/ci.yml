@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: [main, "codex/**"]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -22,3 +22,8 @@ jobs:
           node-version: '24.21.0'
           package-manager-cache: false
       - run: npm test
+      - run: npm ci --prefix plugins/dsh-personal-assistant
+      - run: npm run check --prefix plugins/dsh-personal-assistant
+      - run: npm run build --prefix plugins/dsh-personal-assistant
+      - run: npm test --prefix plugins/dsh-personal-assistant
+      - run: npm run test:package --prefix plugins/dsh-personal-assistant

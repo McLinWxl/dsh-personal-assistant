@@ -1,44 +1,64 @@
 # DSH Personal Assistant
 
-面向 DeepSeek Harness 的本地个人助手插件，正在开发中。公开仓库：[McLinWxl/dsh-personal-assistant](https://github.com/McLinWxl/dsh-personal-assistant)。
+DeepSeek Harness 的本地个人助手插件。以时间组织记忆，让工作、生活和跨年度项目共享适用经验；提供日历、任务执行、工具维护和微信入口。
 
-以时间线组织长期记忆，让工作、生活和跨年度项目共享适用经验；结合日历、任务执行、工具维护与微信对话。数据集中存放在用户选择的本地目录，支持迁移。
+正式源码位于 `plugins/dsh-personal-assistant/`，当前版本 `0.1.0-alpha.1`，MIT 许可证。适配 DSH `0.2.1-rc.5`，运行时需要 Node.js 24.9 以上版本。
 
-## 当前进展
+## 功能
 
-- 已完成 SQLite 记忆原型：新项目、旧经验关联、自动整理、撤回时保留人工修改。
-- 已通过真实 DSH Agent、模型与会话恢复验证上述数据链路；摘要完整性和时区展示仍需实现改进。
-- Windows、macOS、Linux 的 CI 各通过 37 项测试；已配置版本标签触发的打包发布流程。见 [首次 CI 结果](https://github.com/McLinWxl/dsh-personal-assistant/actions/runs/41756059955)。
-- 正式插件、界面、日历、微信接入和完整迁移仍在开发计划中。当前仓库尚不能直接作为插件安装，也没有发布可下载版本。
+- 所有工作区的 DSH 原生对话共享记忆能力，继续使用各自的模型、工具、权限和工作目录。
+- 原生“个人助手”工作区承接日常需求、任务和整理报告；“助手管理”提供业务管理页面。
+- 记忆保留时间、领域、主题和项目关系；定期分类与归并，撤回时保留之后的人工修改。
+- 默认保留普通对话归档 90 天、撤回差量 72 小时，均可设置；到期回收。
+- 月历、周历、日程列表、重复事件单次调整、时区与 ICS。
+- 真实任务执行、结果核对、工具草稿、固定版本工作流及维护建议。
+- 微信官方机器人入口、主人绑定、文字和附件收发、通知；账号由用户最后绑定验证。
+- 单目录保存业务内容、工具、附件、设置和加密凭据；支持导出、校验和迁移。
 
-## 安装与发布
+## 安装
 
-正式包通过 GitHub Releases 分发。在 DSH 的插件管理中添加该版本的 `.tgz` 下载地址。首次安装验收完成后，这里会补充可用的安装链接与适用 DSH 版本。
+开发包已可生成并在隔离 DSH 中安装。公开下载地址将在 GitHub Release 资产实际发布后补充；仓库地址本身不是安装包。
 
-发布约定、安装入口和升级规则见 [GitHub 同步与发布](docs/10-distribution.md)。
+```sh
+cd plugins/dsh-personal-assistant
+npm ci
+npm run build
+npm pack --ignore-scripts
+```
 
-## 设计与验证
+在 DSH 的插件管理中添加生成的 tgz 路径；也可运行：
+
+```sh
+dsh plugin --profile desktop add file:/absolute/path/dsh-personal-assistant-0.1.0-alpha.1.tgz
+```
+
+启动后在原生“个人助手”工作区对话；打开“助手管理”的设置选择数据目录和 DSH 已配置的模型。微信通过“设置口令 → 连接微信”绑定；重启后解锁凭据即可恢复连接。
+
+## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [能力与产品设计](docs/05-assistant-design.md) | 记忆、日历、任务、工具、微信和迁移 |
-| [实现与验收](docs/06-assistant-implementation.md) | 模块、数据模型、DSH 接口、阶段与验收 |
-| [长期个人记忆](docs/07-lifelong-memory.md) | 时间主线、多维关联、整理、遗忘与跨年复用 |
-| [记忆链路验证](docs/08-memory-validation.md) | 事务、关联、撤回、人工编辑与到期回收 |
-| [真实会话与模型验证](docs/09-live-session-validation.md) | 自然语言创建、提炼、整理和会话恢复 |
-| [GitHub 同步与发布](docs/10-distribution.md) | 自动检查、打包、版本与安装链接 |
-| [技术原型](spikes/memory-lifecycle/README.md) | 可运行代码与合成场景结果 |
+| [产品设计](docs/05-assistant-design.md) | 七项核心能力和使用方式 |
+| [技术实现](docs/06-assistant-implementation.md) | 模块、数据模型与接口 |
+| [长期记忆](docs/07-lifelong-memory.md) | 时间、关联、整理和遗忘 |
+| [原生工作区接入](docs/12-native-workspace-integration.md) | 全局记忆、原生对话与整理报告 |
+| [正式实施与验收](docs/11-implementation-progress.md) | 当前能力、真实运行发现和修复 |
+| [实测检查记录](docs/validation/formal-live-20261104.json) | 合成资料的真实模型链路 |
+| [发布流程](docs/10-distribution.md) | 三系统 CI、打包与 GitHub Release |
+| [早期记忆原型](docs/08-memory-validation.md) | 原型事务与撤回测试 |
+| [早期会话验证](docs/09-live-session-validation.md) | 原型自然语言流程 |
 
-## 开发
-
-Node.js 24.9 或更新版本；CI 使用 24.21.0。
+## 开发验证
 
 ```sh
 npm test
+npm ci --prefix plugins/dsh-personal-assistant
+npm run check --prefix plugins/dsh-personal-assistant
+npm run build --prefix plugins/dsh-personal-assistant
+npm test --prefix plugins/dsh-personal-assistant
+npm run test:package --prefix plugins/dsh-personal-assistant
 ```
 
-测试使用临时目录与虚构资料，不需要模型账号或安装 DSH。真实模型实验另行运行，会使用本机配置的模型账户；参见原型文档。
+自动测试使用临时目录和合成资料。真实会话实验使用 DSH 中已配置的账户。源码和安装包不包含业务数据库、凭据、本机会话或个人资料。
 
-根目录是开发工程，正式 bundle 计划位于 `plugins/dsh-personal-assistant/`。发布脚本只打包该目录，业务数据不随源码和安装包分发。
-
-公开源码的许可证尚待项目所有者确定，首个版本发布前补齐。DSH 本身及其第三方依赖遵循各自许可证。
+本机已完成正式插件的 macOS 真实 DSH 验证。Windows、Linux 的原生界面验收和微信真实账号验收仍需相应环境；最新结果以实施记录为准。DSH 原生会话日志与模型账号由宿主管理，迁移插件目录后仍需配置宿主账户。

@@ -26,6 +26,8 @@ jobs:
       - run: npm run release:check
       - run: npm ci
         working-directory: plugins/dsh-personal-assistant
+      - run: npm run check
+        working-directory: plugins/dsh-personal-assistant
       - run: npm run build
         working-directory: plugins/dsh-personal-assistant
       - run: npm test
@@ -48,6 +50,8 @@ jobs:
           package-manager-cache: false
       - run: npm run release:check
       - run: npm ci
+        working-directory: plugins/dsh-personal-assistant
+      - run: npm run check
         working-directory: plugins/dsh-personal-assistant
       - run: npm run build
         working-directory: plugins/dsh-personal-assistant
