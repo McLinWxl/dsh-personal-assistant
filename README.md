@@ -44,6 +44,7 @@ dsh plugin --profile desktop add file:/absolute/path/dsh-personal-assistant-0.1.
 | [界面与扫码连接](docs/13-interface-and-device-login.md) | 页面层级、默认设置、系统凭据与验证记录 |
 | [原生工作区接入](docs/12-native-workspace-integration.md) | 全局记忆、原生对话与整理报告 |
 | [正式实施与验收](docs/11-implementation-progress.md) | 当前能力、真实运行发现和修复 |
+| [微信实测记录](docs/validation/weixin-live-20261104.json) | 真实扫码、原生会话归属与文字收发 |
 | [实测检查记录](docs/validation/formal-live-20261104.json) | 合成资料的真实模型链路 |
 | [发布流程](docs/10-distribution.md) | 三系统 CI、打包与 GitHub Release |
 | [早期记忆原型](docs/08-memory-validation.md) | 原型事务与撤回测试 |
@@ -62,4 +63,4 @@ npm run test:package --prefix plugins/dsh-personal-assistant
 
 自动测试使用临时目录和合成资料。真实会话实验使用 DSH 中已配置的账户。源码和安装包不包含业务数据库、凭据、本机会话或个人资料。
 
-本机已完成正式插件的 macOS 真实 DSH 验证。微信真实扫码绑定已完成，消息收发待验证；Windows、Linux 原生界面仍需相应环境，最新结果以实施记录为准。DSH 原生会话日志与模型账号由宿主管理，迁移插件目录后仍需配置宿主账户。
+本机已完成正式插件的 macOS 真实 DSH 验证。微信真实扫码绑定、原生会话处理与文字消息往返已验证；Windows、Linux 原生界面仍需相应环境，最新结果以实施记录为准。DSH 原生会话日志与模型账号由宿主管理，迁移插件目录后仍需配置宿主账户。

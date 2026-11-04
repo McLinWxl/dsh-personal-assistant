@@ -1,0 +1,26 @@
+{
+  "date": "2026-11-04",
+  "timezone": "Asia/Shanghai",
+  "platform": "macOS arm64",
+  "plugin": "0.1.0-alpha.1",
+  "checks": {
+    "qrLoginConfirmed": true,
+    "systemCredentialReadFromSeparateProcess": true,
+    "inboundProcessed": true,
+    "matchedOutboundSent": true,
+    "nativeReplyMatchesOutbound": true,
+    "nativeTurnCompleted": true,
+    "nativeAssistantWorkspace": true,
+    "userConfirmedReceipt": true
+  },
+  "receivedAt": "2026-11-04T05:37:07.596Z",
+  "repliedAt": "2026-11-04T05:37:14.283Z",
+  "notYetVerified": [
+    "reloadAfterRealLogin",
+    "networkReconnect",
+    "realAttachments",
+    "realNotifications",
+    "windowsCredentialStore",
+    "linuxCredentialStore"
+  ]
+}
