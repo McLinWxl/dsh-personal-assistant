@@ -32,6 +32,11 @@ async function handle(method:string,a:any){
     case'maintenanceProgress':{const total=store.rows('memory').length;store.db.prepare('INSERT OR REPLACE INTO settings VALUES(?,?)').run('maintenance-offset',String(a.offset>=total?0:a.offset));return{saved:true};}
     case'maintenanceDone':store.db.prepare('INSERT OR REPLACE INTO settings VALUES(?,?)').run('maintenance-stamp',String(a.stamp));return{saved:true};
     case'maintenanceApply':return store.command(a.requestId,{method,commands:a.commands,sourceId:a.sourceId??null},()=>{const allowed=new Set(['memoryCapture','memoryRefresh','memoryClassify','memoryPrune','consolidate','sourceReview','toolSave']);const refs=(item:any)=>item.command==='consolidate'?(item.payload.groups??[]).flatMap((g:any)=>g.memories):item.payload.id&&item.payload.revision!==undefined?[item.payload]:[];for(const item of a.commands){if(!allowed.has(item.command))throw new Error('MAINTENANCE_COMMAND_NOT_ALLOWED');for(const ref of refs(item))if(store.node(ref.id).revision!==ref.revision)throw new Error('STALE_VERSION');}const results=[];for(const [i,original]of a.commands.entries()){const item=structuredClone(original);for(const ref of refs(item))ref.revision=store.node(ref.id).revision;results.push(store.dispatch(item.command,item.payload,a.requestId+':'+i,{kind:'maintenance',sourceId:a.sourceId}));}return{results};});
+    case'projectInspect':return store.projects.inspect(a.sourceId);
+    case'projectPending':return store.projects.pending(a.limit,a.busy);
+    case'projectRetry':return store.projects.retry(a.sourceId,a.error)??{resolved:true};
+    case'projectPreview':return store.projects.preview(a);
+    case'projectApply':{const {requestId,...input}=a;return store.command(requestId,{method,...input},()=>store.projects.apply(input));}
     case'command':return store.dispatch(a.command,a.payload,a.requestId,a.actor);
     case'health':return store.health();
     case'source':return store.addSource(a);

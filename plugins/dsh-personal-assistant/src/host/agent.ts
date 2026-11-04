@@ -5,6 +5,7 @@ export const name='personal-assistant-agent';
 export const inject=['personalAssistant','tools','systemPrompt'];
 const persona=`你可以使用用户的共享长期记忆与个人管理能力。保持当前工作区的助手角色、任务目标、工具、工作目录及权限。用户提出个人管理需求时，使用工具真正创建、修改和维护项目、记忆、任务、日程与工作流。
 每轮先使用已提供的相关记忆；需要更多内容时按相关性查询。项目保持独立身份，适用经验通过关系跨项目复用。
+用户明确要求建项目、已决定开展持续事项，或继续讨论已有项目时，先调用 assistant_projectResolve；如果用户要求当前轮暂缓或交由后台整理，则本轮不调用，交给后台补处理；明确拒绝记录或建项时不创建。它会统一匹配跨工作区项目、创建新事项并关联适用的历史经验。只使用返回的 projectId 关联记忆、任务和日程；status 为 defer、review、ignore、undone 或 removed 时不得自行声称已建项目。换工作区不代表新项目，新的年份或批次不与旧项目合并。假设和一次性小事无需建项目。
 重要事实、偏好、经历、决定与任务结果应自动提炼。记忆 quote 必须是当前来源的完整连续片段；sourceId 来自本轮上下文。时间戳使用完整 ISO 秒数和偏移，例如 2026-11-04T00:00:00+08:00；importance 只能为 1 至 5。保留条件、用途、例外、否定及发生时间，不把建议行动写成前置条件。reusable 只用于确实可跨项目复用的经验；某次活动的特殊安排默认不可复用。
 普通闲聊用 sourceReview 标为 ordinary；重要内容成功提炼后再标 captured。不确定日期明确保留时间精度，不能凭空补造年份。时间输入必须携带偏移，向用户展示工具返回的时区时间。
 先核对当前版本再修改。用户明确纠正的正文按原意保存。正文改动会使派生事实待刷新，不能把旧事实当成最新结论。整理保留原始命题与引用，归并只改变派生摘要；遇到冲突、独特经历或人工保护项保留各自记录。
@@ -13,7 +14,7 @@ const persona=`你可以使用用户的共享长期记忆与个人管理能力�
 自动修改完成后用简短答复说明结果和可撤回期限。不要把完整旧版本重复写进聊天。`;
 const descriptions:Partial<Record<Command,string>>={
  memoryRemove:'用户要求删除某条长期记忆时使用；删除记录及其关联，可在期限内撤回。原生会话历史由 DSH 管理。',
- memoryRefresh:'从当前人工正文重新提炼派生事实，不改写正文或旧命题。',memoryClassify:'整理记忆分类与主题，保留人工分类。',memoryPrune:'删除一年以上、低价值、无关联且无人工保护的普通知识；重要经历不删除。',projectCreate:'创建独立项目。context 只保存已知场景条件。',projectEdit:'更新项目状态、目标和类别。',
+ memoryRefresh:'从当前人工正文重新提炼派生事实，不改写正文或旧命题。',memoryClassify:'整理记忆分类与主题，保留人工分类。',memoryPrune:'删除一年以上、低价值、无关联且无人工保护的普通知识；重要经历不删除。',projectEdit:'更新项目状态、目标和类别。',
  memoryCapture:'从当前来源提炼一条有完整引用的长期记忆，并与项目原子关联。',memoryEdit:'按用户明确要求修正或固定记忆，保留人工措辞。',memorySearch:'按相关性召回记忆；外发或子任务用 external。',relations:'读取对象的双向关联，包括所属项目、复用经验和实体。',related:'寻找适用于新项目的可复用历史经验。',associate:'关联经过适用性判断的旧经验，保留独立项目身份。',
  consolidate:'提交等价记忆的归并组及完整统一命题；保留原始命题。',undo:'撤回变更，保留后续人工修改。',change:'读取变更详情与撤回期限。',changes:'分页查看变更批次。',
  taskCreate:'创建任务；dueAt 是期限，不等于日历时段。',taskEdit:'更新任务。完成状态由执行结果或用户确认决定。',eventOverride:'修改或取消重复日程中的单次实例，occurrence 使用 calendar 返回的 occurrenceKey。',eventCreate:'创建日历日程。时间携带时区偏移；全天结束日期不包含当天。',eventEdit:'按当前版本修改日程。',calendar:'读取指定时间范围的日历实例。',toolSave:'创建或维护工具版本；新增脚本及能力产生草稿。',toolVersions:'查看工具历史版本。',sourceReview:'完成本轮来源整理，普通闲聊标 ordinary。',entitySave:'保存人物、地点、组织、物品与主题实体。',link:'建立对象间关联。',get:'读取当前对象及版本。',list:'按类别、项目与关键词分页查询。',
@@ -43,6 +44,7 @@ export function apply(ctx:any,config:any={}){
   return assembled;
  });
  const review=new Set(['list','get','memorySearch','consolidate','sourceReview','toolSave','changes','change','memoryRefresh','memoryPrune','memoryClassify','memoryCapture']);
+ if(!config.reviewOnly)ctx.tools.register(defineTool({name:'assistant_projectResolve',description:'从当前用户消息识别持续事项，匹配跨工作区的已有项目，必要时创建新项目并关联历史经验。返回实际项目、通知与可撤回变更；假设、一次性事项或不明确内容不自动建项目。',parameters:{},output:{schema:{type:'json'},render:(_a:any,v:any)=>[{type:'text',text:JSON.stringify(v)}]},async execute(_a:any,e:any){if(!e.agent||e.agent.session.header.origin==='subagent')throw new Error('ASSISTANT_OWNER_SESSION_REQUIRED');const source=await ctx.personalAssistant.currentSource(e.agent);if(!source)throw new Error('PROJECT_USER_SOURCE_REQUIRED');return ctx.personalAssistant.projects.resolve(source.id,undefined,e.signal);}}));
  for(const [command,description]of Object.entries(descriptions)){
   if(config.reviewOnly&&!review.has(command))continue;
   const shape=spec(z.toJSONSchema(schemas[command as Command],{unrepresentable:'any'}));

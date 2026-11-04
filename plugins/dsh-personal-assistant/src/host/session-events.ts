@@ -11,6 +11,7 @@ export function sourceFromEvent(session:any,event:any){
  if(event.type==='user/message'&&!isUserMessage(event)||message.source?.kind===REPORT_SOURCE)return null;
  const text=messageText(message);if(!message.id||!text)return null;
  return{id:session.id+':'+message.id,sessionId:session.id,role:event.type==='user/message'?'user':'assistant',text,
+  projectEligible:!String(message.source?.rpcId??'').startsWith('run:'),
   status:event.type==='user/message'&&!String(message.source?.rpcId??'').startsWith('run:')?'buffered':'ordinary',
   context:{workspace:session.header.cwd??'',preset:session.header.agentPreset??'',origin:session.header.origin??'user'}};
 }
