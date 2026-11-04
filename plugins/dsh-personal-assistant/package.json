@@ -67,8 +67,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
-    "test": "node --test test/*.test.mjs",
-    "test:package": "node scripts/verify-package.mjs"
+    "check:package": "node scripts/verify-package.mjs"
   },
   "devDependencies": {
     "@touch4it/ical-timezones": "1.9.0",

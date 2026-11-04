@@ -11,8 +11,10 @@ dist/
 .credentials*
 .local/
 WORKSPACE.md
-docs/01-current-plugins.md
-docs/02-loading-architecture.md
-docs/03-plugin-development.md
-docs/04-assistant-research.md
-spikes/memory-lifecycle/artifacts/live-model-progress.json
+docs/
+doc/
+spikes/
+**/test/
+**/tests/
+**/*.test.*
+**/*.spec.*

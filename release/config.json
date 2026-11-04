@@ -3,5 +3,5 @@
   "repository": "McLinWxl/dsh-personal-assistant",
   "packageDirectory": "plugins/dsh-personal-assistant",
   "assetName": "dsh-personal-assistant.tgz",
-  "releaseEnabled": false
+  "releaseEnabled": true
 }

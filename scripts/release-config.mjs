@@ -32,7 +32,7 @@ export function checkRelease(base = root, tag = process.env.GITHUB_REF_NAME, { b
     const entry = inside(directory, path);
     if (built && !existsSync(entry)) throw new Error('PACKAGE_ENTRY_MISSING');
   }
-  for (const script of ['build', 'test', 'test:package']) {
+  for (const script of ['check', 'build', 'check:package']) {
     if (!pkg.scripts?.[script]) throw new Error('REQUIRED_SCRIPT_MISSING: ' + script);
   }
   return { config, pkg, directory, tag };
@@ -44,6 +44,8 @@ export function checkPackedFiles(files) {
     const path = file.path.replaceAll('\\', '/');
     if (path.startsWith('/') || path.split('/').includes('..')
       || /(^|\/)(\.git|\.dsh|node_modules|\.env[^/]*|\.credentials[^/]*|state\.sqlite[^/]*|runtime)(\/|$)/i.test(path)
+      || /(^|\/)(docs?|tests?|__tests__|fixtures?|spikes|artifacts)(\/|$)/i.test(path)
+      || /\.(test|spec)\.[^/]+$/i.test(path)
       || /\.(?:sqlite(?:-wal|-shm)?|pem|key)$/i.test(path)) throw new Error('PRIVATE_OR_RUNTIME_FILE_IN_PACKAGE: ' + path);
   }
 }

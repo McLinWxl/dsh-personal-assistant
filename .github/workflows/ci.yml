@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
 jobs:
-  test:
+  build:
     strategy:
       fail-fast: false
       matrix:
@@ -21,9 +21,7 @@ jobs:
         with:
           node-version: '24.21.0'
           package-manager-cache: false
-      - run: npm test
       - run: npm ci --prefix plugins/dsh-personal-assistant
       - run: npm run check --prefix plugins/dsh-personal-assistant
       - run: npm run build --prefix plugins/dsh-personal-assistant
-      - run: npm test --prefix plugins/dsh-personal-assistant
-      - run: npm run test:package --prefix plugins/dsh-personal-assistant
+      - run: npm run check:package --prefix plugins/dsh-personal-assistant

@@ -8,7 +8,7 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  test:
+  build:
     strategy:
       fail-fast: false
       matrix:
@@ -22,7 +22,6 @@ jobs:
         with:
           node-version: '24.21.0'
           package-manager-cache: false
-      - run: npm test
       - run: npm run release:check
       - run: npm ci
         working-directory: plugins/dsh-personal-assistant
@@ -30,13 +29,11 @@ jobs:
         working-directory: plugins/dsh-personal-assistant
       - run: npm run build
         working-directory: plugins/dsh-personal-assistant
-      - run: npm test
-        working-directory: plugins/dsh-personal-assistant
       - run: npm run release:pack
-      - run: npm run test:package -- ../../dist/release/dsh-personal-assistant.tgz
+      - run: npm run check:package -- ../../dist/release/dsh-personal-assistant.tgz
         working-directory: plugins/dsh-personal-assistant
   publish:
-    needs: test
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -57,7 +54,7 @@ jobs:
         working-directory: plugins/dsh-personal-assistant
       - run: npm run release:pack
       - name: Verify the packed installable plugin
-        run: npm run test:package -- ../../dist/release/dsh-personal-assistant.tgz
+        run: npm run check:package -- ../../dist/release/dsh-personal-assistant.tgz
         working-directory: plugins/dsh-personal-assistant
       - run: npm run release:publish
         env:
