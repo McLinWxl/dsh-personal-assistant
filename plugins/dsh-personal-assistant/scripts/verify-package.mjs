@@ -1,9 +1,19 @@
 import {spawnSync} from 'node:child_process';
 import {mkdtempSync,readFileSync,rmSync,statSync} from 'node:fs';
 import {tmpdir} from 'node:os';import {join,resolve} from 'node:path';import {fileURLToPath,pathToFileURL} from 'node:url';import {Worker} from 'node:worker_threads';import assert from 'node:assert/strict';
+import {archiveFiles} from './archive-files.mjs';
 const root=fileURLToPath(new URL('../',import.meta.url)),temp=mkdtempSync(join(tmpdir(),'assistant-package-'));
 try{
- let archive,manifest;if(process.argv[2]){archive=resolve(process.argv[2]);const listed=spawnSync('tar',['-tzf',archive],{encoding:'utf8'});if(listed.status!==0)throw new Error(listed.stderr);manifest={size:statSync(archive).size,files:listed.stdout.trim().split('\n').filter(p=>!p.endsWith('/')).map(path=>{assert.ok(path.startsWith('package/')&&!path.split('/').includes('..'));return{path:path.slice(8)};})};}else{const packed=spawnSync(process.execPath,[process.env.npm_execpath,'pack','--ignore-scripts','--json','--pack-destination',temp],{cwd:root,encoding:'utf8'});if(packed.status!==0)throw new Error(packed.stderr);manifest=JSON.parse(packed.stdout)[0];archive=join(temp,manifest.filename);}
+ let archive;
+ if(process.argv[2]) archive=resolve(process.argv[2]);
+ else {
+  const packed=spawnSync(process.execPath,[process.env.npm_execpath,'pack','--ignore-scripts','--json','--pack-destination',temp],{cwd:root,encoding:'utf8'});
+  if(packed.status!==0)throw packed.error??new Error(packed.stderr);
+  archive=join(temp,JSON.parse(packed.stdout)[0].filename);
+ }
+ const listed=spawnSync('tar',['-tzf',archive],{encoding:'utf8'});
+ if(listed.status!==0)throw listed.error??new Error(listed.stderr);
+ const manifest={size:statSync(archive).size,files:archiveFiles(listed.stdout)};
  for(const item of manifest.files){assert.ok(!/(^|\/)(node_modules|src|docs?|tests?|__tests__|fixtures?|spikes|artifacts|\.local|runtime)(\/|$)/i.test(item.path));assert.ok(!/(^|\/)(\.env[^/]*|\.credentials[^/]*)(\/|$)/i.test(item.path));assert.ok(!/\.(test|spec)\.[^/]+$/i.test(item.path));assert.ok(!/\.(sqlite(?:-wal|-shm)?|key|pem)$/i.test(item.path));}
  for(const file of ['lib/host.js','lib/agent.js','lib/client.js','lib/worker.js','lib/zones.json','LICENSE','THIRD_PARTY_NOTICES.md','cordis.patch.yml'])assert.ok(manifest.files.some(f=>f.path===file),file);
  const unpack=spawnSync('tar',['-xzf',archive,'-C',temp],{encoding:'utf8'});if(unpack.status!==0)throw new Error(unpack.stderr);

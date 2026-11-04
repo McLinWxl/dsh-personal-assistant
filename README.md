@@ -6,7 +6,7 @@ DeepSeek Harness 的本地个人助手插件，MIT 许可证。支持长期记�
 
 ## 安装
 
-适配 DSH `0.2.1-rc.5`，需要 Node.js `24.9` 以上版本。当前版本为 `0.1.0-alpha.1`。
+适配 DSH `0.2.1-rc.5`，需要 Node.js `24.9` 以上版本。当前版本为 `0.1.0-alpha.2`。
 
 发布包位于 [GitHub Releases](https://github.com/McLinWxl/dsh-personal-assistant/releases)。在 DSH「插件 → 添加插件」中填入对应版本的 `dsh-personal-assistant.tgz` 下载链接。
 

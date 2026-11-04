@@ -1,6 +1,6 @@
 # DSH Personal Assistant
 
-DeepSeek Harness 的本地个人助手插件，版本 `0.1.0-alpha.1`，MIT。适配 DSH `0.2.1-rc.5`，需要 Node.js `24.9` 以上版本。
+DeepSeek Harness 的本地个人助手插件，版本 `0.1.0-alpha.2`，MIT。适配 DSH `0.2.1-rc.5`，需要 Node.js `24.9` 以上版本。
 
 支持长期记忆、跨项目经验关联、自动整理与撤回、日历与 ICS、任务执行、工具管理和微信入口。所有工作区共享记忆能力；对话使用 DSH 原生页面，“助手管理”提供业务管理界面。
 
