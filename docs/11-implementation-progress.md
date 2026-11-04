@@ -72,4 +72,8 @@ DSH 原生会话日志仍由宿主管理。插件迁移来源归档与业务记�
 
 当前包为 alpha。发布配置保持关闭，公开安装链接仅在实际发布资产存在后写入 README。
 
+2026-11-04 已通过 DSH 官方 CLI 将最终安装包安装到本机 desktop 配置，核对版本为 `0.1.0-alpha.1`、业务数据库完整性通过，原生“个人助手”工作区已登记。正式数据目录独立初始化，未导入验证场景。已打开的桌面客户端需重新启动以加载新增入口。
+
+本次 GitHub 推送被自动审批检查拒绝，当前提交仅在本地；新增远程 CI 与公开下载资产尚未生成。
+
 微信协议依据：[腾讯官方协议文档](https://github.com/Tencent/openclaw-weixin/blob/main/docs/protocol_zh_CN.md)、[官方 CDN 实现](https://github.com/Tencent/openclaw-weixin/tree/main/src/cdn)。本插件独立实现适配，没有依赖个人微信桌面端注入。
