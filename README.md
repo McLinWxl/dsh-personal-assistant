@@ -13,7 +13,7 @@ DeepSeek Harness 的本地个人助手插件。以时间组织记忆，让工作
 - 月历、周历、日程列表、重复事件单次调整、时区与 ICS。
 - 真实任务执行、结果核对、工具草稿、固定版本工作流及维护建议。
 - 微信官方机器人入口、主人绑定、文字和附件收发、通知；账号由用户最后绑定验证。
-- 单目录保存业务内容、工具、附件、设置和加密凭据；支持导出、校验和迁移。
+- 单目录保存业务内容、工具、附件和设置；支持导出、校验和迁移。微信登录凭据由本机系统安全存储保护，新设备重新扫码。
 
 ## 安装
 
@@ -32,7 +32,7 @@ npm pack --ignore-scripts
 dsh plugin --profile desktop add file:/absolute/path/dsh-personal-assistant-0.1.0-alpha.1.tgz
 ```
 
-启动后在原生“个人助手”工作区对话；打开“助手管理”的设置选择数据目录和 DSH 已配置的模型。微信通过“设置口令 → 连接微信”绑定；重启后解锁凭据即可恢复连接。
+启动后在原生“个人助手”工作区对话；打开“助手管理”的设置选择数据目录和 DSH 已配置的模型。模型与基础助手通过下拉选择，目录通过浏览选择。微信点击“连接微信”后扫码，本机重启自动恢复；新设备重新扫码。
 
 ## 文档
 
@@ -41,6 +41,7 @@ dsh plugin --profile desktop add file:/absolute/path/dsh-personal-assistant-0.1.
 | [产品设计](docs/05-assistant-design.md) | 七项核心能力和使用方式 |
 | [技术实现](docs/06-assistant-implementation.md) | 模块、数据模型与接口 |
 | [长期记忆](docs/07-lifelong-memory.md) | 时间、关联、整理和遗忘 |
+| [界面与扫码连接](docs/13-interface-and-device-login.md) | 页面层级、默认设置、系统凭据与验证记录 |
 | [原生工作区接入](docs/12-native-workspace-integration.md) | 全局记忆、原生对话与整理报告 |
 | [正式实施与验收](docs/11-implementation-progress.md) | 当前能力、真实运行发现和修复 |
 | [实测检查记录](docs/validation/formal-live-20261104.json) | 合成资料的真实模型链路 |

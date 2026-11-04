@@ -7,6 +7,7 @@ import {WeixinChannel} from '../channels/weixin.js';
 import * as globalAgent from './agent.js';
 import {Scheduler} from './scheduler.js';
 import {atomicJson} from '../storage/files.js';
+import {settingsOptions} from './settings.js';
 export const name='personal-assistant';
 export const inject=['connection','sessionController','agentPresets','agents','llm','agentDefaultModel','workspaceRegistry','tools','systemPrompt'];
 export const Config=z.object({dataRoot:z.string().default('')});
@@ -27,13 +28,15 @@ export async function apply(ctx:any,config:any){
    case'maintenance.run':await service.storage.call('jobScheduleNow',{id:'memory-daily'});return{scheduled:true};
    case'jobs':return service.storage.call('jobList');
    case'data.export':await scheduler.stop();try{return await service.exportData(payload.destination);}finally{await scheduler.start();}
-   case'data.select':await weixin.stop();await scheduler.stop();try{const result=await service.switchRoot(payload.root);await scheduler.start();return result;}catch(e){await scheduler.start();throw e;}
+   case'data.select':await weixin.stop();await scheduler.stop();try{const result=await service.switchRoot(payload.root);await scheduler.start();await weixin.start();return result;}catch(e){await scheduler.start();await weixin.start();throw e;}
+   case'settings.options':return settingsOptions(ctx,service.root);
+   case'data.exportDestination':{if(typeof payload.parent!=='string'||!payload.parent)throw new Error('ABSOLUTE_EXPORT_PATH_REQUIRED');return join(payload.parent,(await settingsOptions(ctx,service.root)).exportName);}
    case'weixin.status':return weixin.status();
    case'weixin.begin':return weixin.begin();
    case'weixin.poll':return weixin.poll(payload.attemptId,payload.verifyCode);
    case'weixin.disconnect':return weixin.disconnect();
    case'vault.state':return service.storage.call('vaultState');
-   case'vault.unlock':{const result=await service.storage.call('vaultUnlock',payload);await weixin.start();return result;}
+   case'vault.unlock':{await service.storage.call('vaultUnlock',payload);try{const binding=await service.storage.call('vaultGet',{name:'weixin'});if(binding)await weixin.importLegacy(binding);return{imported:!!binding};}finally{await service.storage.call('vaultLock');}}
    case'vault.lock':await weixin.stop();return service.storage.call('vaultLock');
    case'health':return service.storage.call('health');
    case'presets':return ctx.agentPresets.list();
