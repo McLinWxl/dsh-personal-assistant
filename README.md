@@ -8,7 +8,7 @@
 
 - 已完成 SQLite 记忆原型：新项目、旧经验关联、自动整理、撤回时保留人工修改。
 - 已通过真实 DSH Agent、模型与会话恢复验证上述数据链路；摘要完整性和时区展示仍需实现改进。
-- 已配置 Windows、macOS、Linux 自动测试，以及版本标签触发的打包发布流程。
+- Windows、macOS、Linux 的 CI 各通过 37 项测试；已配置版本标签触发的打包发布流程。见 [首次 CI 结果](https://github.com/McLinWxl/dsh-personal-assistant/actions/runs/41756059955)。
 - 正式插件、界面、日历、微信接入和完整迁移仍在开发计划中。当前仓库尚不能直接作为插件安装，也没有发布可下载版本。
 
 ## 安装与发布

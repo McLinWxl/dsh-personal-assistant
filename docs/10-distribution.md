@@ -76,9 +76,17 @@ spikes/memory-lifecycle/        独立验证代码，不作为正式插件发布
 
 ## 6. 本轮验证记录
 
-- 已创建指定公开仓库。
+- 已创建指定公开仓库，开发代码和文档已同步至提交 `82ab4b363946f8d548904af98f5ff1c685a13c4a`。
 - 本机 37 项测试通过：30 项记忆链路测试、7 项发布检查与真实 npm 打包测试。
 - 测试包的文件清单、SHA-256 和版本地址元数据一致；它仅在临时测试目录生成，未作为产品发布。
 - 当前 `release:check` 按预期拒绝未启用发布的工程。
 - 真实宿主解析器接受版本化与稳定版 `.tgz` 地址，拒绝 Releases 列表页；这只验证输入解析，不代表尚不存在的文件可下载。
-- GitHub CI 的实际执行结果以仓库 Actions 对应提交为准；首次同步后补充运行结果。
+- 2026-11-04 09:44（Asia/Shanghai），上述提交的 [首次 CI](https://github.com/McLinWxl/dsh-personal-assistant/actions/runs/41756059955) 全部成功。三个系统均使用 Node.js 24.21.0、npm 11.19.0；逐项日志确认各 37 项测试通过，失败和跳过均为 0。
+
+| GitHub Runner | 通过 | 失败 | 跳过 | 运行记录 |
+|---|---:|---:|---:|---|
+| Windows | 37 | 0 | 0 | [test (windows-latest)](https://github.com/McLinWxl/dsh-personal-assistant/actions/runs/41756059955/job/126332325836) |
+| Ubuntu / Linux | 37 | 0 | 0 | [test (ubuntu-latest)](https://github.com/McLinWxl/dsh-personal-assistant/actions/runs/41756059955/job/126332326126) |
+| macOS | 37 | 0 | 0 | [test (macos-latest)](https://github.com/McLinWxl/dsh-personal-assistant/actions/runs/41756059955/job/126332326428) |
+
+本次执行覆盖记忆领域逻辑、真实子进程中断恢复、目录复制、发布条件校验与临时 npm 包生成。正式 DSH bundle 的下载、安装、启用、升级和卸载仍待实现后验证；Release 列表当前为空，尚无可用安装包。后续文档更新不改变上述被测代码提交。

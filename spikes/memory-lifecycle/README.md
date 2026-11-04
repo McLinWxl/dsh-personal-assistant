@@ -17,7 +17,7 @@ npm run verify:dsh
 DSH_MODEL=deepseek-v4-pro DSH_REASONING_EFFORT=low npm run verify:live
 ```
 
-没有第三方 npm 依赖，无须执行安装。`verify:dsh` 在 macOS 默认寻找 `/Applications/DeepSeek Harness.app`。其他安装位置可设置 `DSH_EXECUTABLE` 和 `DSH_MODULES`，分别指向可使用 `ELECTRON_RUN_AS_NODE=1` 的应用可执行文件，以及 DSH 的 `node_modules` 目录。其他系统尚未运行验证。
+没有第三方 npm 依赖，无须执行安装。`verify:dsh` 在 macOS 默认寻找 `/Applications/DeepSeek Harness.app`。其他安装位置可设置 `DSH_EXECUTABLE` 和 `DSH_MODULES`，分别指向可使用 `ELECTRON_RUN_AS_NODE=1` 的应用可执行文件，以及 DSH 的 `node_modules` 目录。真实 DSH 宿主与模型接入目前只在 macOS 验证。
 
 ## 代码
 
@@ -34,6 +34,8 @@ DSH_MODEL=deepseek-v4-pro DSH_REASONING_EFFORT=low npm run verify:live
 | [lifecycle.test.mjs](test/lifecycle.test.mjs) | 30 项测试，包括真实子进程退出恢复与目录搬移 |
 
 ## 结果
+
+2026-11-04，GitHub CI 在 Windows、Ubuntu / Linux、macOS 的 Node.js 24.21.0 上分别通过全部 37 项测试：本原型 30 项，加发布脚本 7 项；失败和跳过均为 0。运行链接和对应提交见 [发布验证记录](../../docs/10-distribution.md#6-本轮验证记录)。
 
 2026-11-03，macOS arm64：本机 Node 25.2.1 和 DSH 自带 Node 24.21.0 均通过 30 项测试。DSH 0.2.1-rc.5 的真实 Cordis/ToolRuntime 中同一链路通过，工具参数校验、卸载和重新启用通过。
 
