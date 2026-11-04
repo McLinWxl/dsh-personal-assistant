@@ -8,10 +8,11 @@ import * as globalAgent from './agent.js';
 import {Scheduler} from './scheduler.js';
 import {atomicJson} from '../storage/files.js';
 import {settingsOptions} from './settings.js';
+import type {PluginContext,PluginConfig} from './context.js';
 export const name='personal-assistant';
 export const inject=['connection','sessionController','agentPresets','agents','llm','agentDefaultModel','workspaceRegistry','tools','systemPrompt'];
 export const Config=z.object({dataRoot:z.string().default('')});
-export async function apply(ctx:any,config:any){
+export async function apply(ctx:PluginContext,config:PluginConfig){
  const home=process.env.DSH_HOME||join(homedir(),'.dsh'),locator=join(home,'personal-assistant.json');
  let stored;try{stored=existsSync(locator)?JSON.parse(readFileSync(locator,'utf8')).root:undefined;}catch{}
  const root=stored||config.dataRoot||join(homedir(),'Documents','DSH Assistant');

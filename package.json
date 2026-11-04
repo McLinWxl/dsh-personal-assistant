@@ -10,6 +10,8 @@
     "check": "npm run check --prefix plugins/dsh-personal-assistant",
     "build": "npm run build --prefix plugins/dsh-personal-assistant",
     "check:package": "npm run check:package --prefix plugins/dsh-personal-assistant",
+    "dev": "npm run dev --prefix plugins/dsh-personal-assistant",
+    "dev:watch": "npm run dev:watch --prefix plugins/dsh-personal-assistant",
     "release:check": "node scripts/release-config.mjs",
     "release:pack": "node scripts/pack-release.mjs",
     "release:publish": "node scripts/publish-release.mjs"

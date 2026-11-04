@@ -72,11 +72,17 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
-    "check:package": "node scripts/verify-package.mjs"
+    "check:package": "node scripts/verify-package.mjs",
+    "dev": "npm run build && node scripts/dev-sync.mjs",
+    "dev:sync": "node scripts/dev-sync.mjs",
+    "dev:watch": "node scripts/dev-sync.mjs --watch"
   },
   "devDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.5",
     "@touch4it/ical-timezones": "1.9.0",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^18.3.0",
     "esbuild": "0.28.2",
     "ical.js": "2.2.1",

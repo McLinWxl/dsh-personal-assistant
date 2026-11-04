@@ -55,6 +55,15 @@ npm pack ./plugins/dsh-personal-assistant --ignore-scripts --pack-destination di
 
 将 `dist/` 中生成的 `.tgz` 文件添加到 DSH。
 
+已在本机安装插件时，可以用下面的命令直接迭代，无需每次重新打包安装：
+
+```sh
+npm run dev        # 构建并同步到本机 DSH 配置目录中的插件副本
+npm run dev:watch  # 监听 src/，改动后自动构建并同步
+```
+
+同步完成后，只改客户端界面时刷新页面即可看到效果；改动 host、agent 或 worker 时，在 DSH 插件页重载插件或重启 DSH。DSH 加载的是配置目录中的插件副本，仓库目录的改动不会自动生效。
+
 | 目录 | 用途 |
 | --- | --- |
 | `plugins/dsh-personal-assistant/src/` | 插件业务源码 |

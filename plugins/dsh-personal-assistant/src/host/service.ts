@@ -6,7 +6,7 @@ import {join,resolve,relative,sep,isAbsolute} from 'node:path';
 import {homedir} from 'node:os';
 import {load as loadYaml, Schema, defineScalarTag, JSON_SCHEMA} from 'js-yaml';
 // DSH's documented !!js configuration value is passed through, never evaluated here.
-const entryListSchema=new Schema([...JSON_SCHEMA.tags,defineScalarTag('tag:yaml.org,2002:js',{resolve:(value:string)=>({__jsExpr:value})})]);
+const entryListSchema=new Schema([...JSON_SCHEMA.tags,defineScalarTag('tag:yaml.org,2002:js',{resolve:(value:string)=>({__jsExpr:value})} as unknown as Parameters<typeof defineScalarTag>[1])]);
 import {inside} from '../storage/files.js';
 import {StorageClient} from './storage-client.js';
 import {type Actor} from '../domain/contracts.js';
