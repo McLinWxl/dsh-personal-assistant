@@ -25,8 +25,13 @@
     "./icon": "./icon.svg"
   },
   "files": [
-    "lib",
-    "locale",
+    "lib/host.js",
+    "lib/agent.js",
+    "lib/worker.js",
+    "lib/client.js",
+    "lib/zones.json",
+    "locale/en.json",
+    "locale/zh.json",
     "cordis.patch.yml",
     "icon.svg",
     "LICENSE",

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { resolve, relative, isAbsolute, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+export { checkPackedFiles } from '../plugins/dsh-personal-assistant/scripts/archive-files.mjs';
 
 export const root = fileURLToPath(new URL('../', import.meta.url));
 export function inside(base, path) {
@@ -36,18 +37,6 @@ export function checkRelease(base = root, tag = process.env.GITHUB_REF_NAME, { b
     if (!pkg.scripts?.[script]) throw new Error('REQUIRED_SCRIPT_MISSING: ' + script);
   }
   return { config, pkg, directory, tag };
-}
-
-export function checkPackedFiles(files) {
-  if (!files.length) throw new Error('EMPTY_PACKAGE');
-  for (const file of files) {
-    const path = file.path.replaceAll('\\', '/');
-    if (path.startsWith('/') || path.split('/').includes('..')
-      || /(^|\/)(\.git|\.dsh|node_modules|\.env[^/]*|\.credentials[^/]*|state\.sqlite[^/]*|runtime)(\/|$)/i.test(path)
-      || /(^|\/)(docs?|tests?|__tests__|fixtures?|spikes|artifacts)(\/|$)/i.test(path)
-      || /\.(test|spec)\.[^/]+$/i.test(path)
-      || /\.(?:sqlite(?:-wal|-shm)?|pem|key)$/i.test(path)) throw new Error('PRIVATE_OR_RUNTIME_FILE_IN_PACKAGE: ' + path);
-  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

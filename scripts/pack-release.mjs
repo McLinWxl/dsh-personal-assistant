@@ -16,7 +16,7 @@ export function packRelease(base = root, releaseTag = process.env.GITHUB_REF_NAM
   if (result.error || result.status !== 0) throw result.error ?? new Error(result.stderr);
   const packs = JSON.parse(result.stdout);
   if (packs.length !== 1) throw new Error('EXPECTED_ONE_PACKAGE');
-  checkPackedFiles(packs[0].files);
+  checkPackedFiles(packs[0].files, pkg.files);
   const packed = inside(out, packs[0].filename);
   const target = join(out, config.assetName); renameSync(packed, target);
   const sha256 = createHash('sha256').update(readFileSync(target)).digest('hex');
