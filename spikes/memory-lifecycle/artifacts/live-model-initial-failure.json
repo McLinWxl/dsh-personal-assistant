@@ -1,0 +1,253 @@
+{
+  "verifiedAt": "2026-11-03T08:54:13.843Z",
+  "dshVersion": "0.2.1-rc.5",
+  "provider": "deepseek-account",
+  "model": "deepseek-flash",
+  "passed": false,
+  "failure": {
+    "name": "AssertionError",
+    "code": "ERR_ASSERTION",
+    "message": "Model turn timed out\n\ntrue !== false\n"
+  },
+  "turns": [
+    {
+      "label": "natural-language-history",
+      "sessionId": "history-b9a23cc6-f985-4a63-aa61-d66bb417cfcb",
+      "messageId": "87d80354-679d-4ca0-b53d-acce03753a33",
+      "prompt": "请把旧资料补录到助手：新建一个工作项目“2025 开发者交流日”，已完成，室内活动，需要签到。\n2025 年 11 月 3 日的复盘写道：“室内活动签到前准备离线名单，可以在断网时继续核对来宾。”\n2025 年 11 月 4 日的补充复盘写道：“举办室内活动时，提前备好离线来宾名单，网络中断也能继续签到。”\n当天还发现另一件事：“室内活动签到时，离线名单中的重名人员仍然需要人工核对。”\n把这三条分别提炼为可以长期使用的经验，关联这个旧项目，保留各自的发生日期。前两条说的是同一做法，最后一条是独立的例外处理。先不要整理合并。",
+      "elapsedMs": 11850,
+      "tools": [
+        {
+          "name": "assistant_state",
+          "ok": true
+        },
+        {
+          "name": "project_create",
+          "ok": true
+        },
+        {
+          "name": "memory_find",
+          "ok": true
+        },
+        {
+          "name": "memory_capture",
+          "ok": true
+        },
+        {
+          "name": "memory_capture",
+          "ok": true
+        },
+        {
+          "name": "memory_capture",
+          "ok": true
+        },
+        {
+          "name": "assistant_state",
+          "ok": true
+        }
+      ],
+      "reply": "已完成补录。新建项目并逐条关联了三段经验：项目内目前没有可复用的旧记忆，这三条都是本次新提炼的经验。\n\n**项目**\n- 「2025 开发者交流日」：工作、活动组织；已完成；`venue: indoor`、`checkIn: true`\n\n**三条经验（各自保留发生日期，未做任何合并整理）**\n1. **2025-11-03** ｜方法：室内活动签到前准备离线名单，断网时可继续核对来宾。\n2. **2025-11-04** ｜方法（补充复盘）：举办室内活动时提前备好离线来宾名单，网络中断也能继续签到。\n   - 与第 1 条语义相同，按你的要求各自独立保留，未合并。\n3. **2025-11-04** ｜事实（独立例外）：室内活动签到时，离线名单中的重名人员仍需人工核对。\n\n三条都已与「2025 开发者交流日」建立关联（learned_from），并写入条件 `venue: indoor`、`checkIn: true`、`offlineList: true`。没有执行整理，也没有合并，因此没有可撤回的整理批次。",
+      "end": {
+        "turn": 1,
+        "reason": {
+          "kind": "completed"
+        }
+      }
+    },
+    {
+      "label": "fresh-session-new-project-and-recall",
+      "sessionId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c",
+      "messageId": "85050703-9e47-4321-a192-f0876ce129ad",
+      "prompt": "今天是 2026 年 11 月 3 日。帮我新建一个生活项目“家人的周末聚会”：室内活动，需要准备签到与到场名单。\n找一找我以前工作或生活中可以复用的经验，并把适用的经验关联到这个新项目。项目身份独立保留。\n另外记录我今天确认的一条安排：“这次家庭聚会有儿童参加，需要在签到后发放儿童餐券。”",
+      "elapsedMs": 180017,
+      "tools": [
+        {
+          "name": "assistant_state",
+          "ok": true
+        },
+        {
+          "name": "project_create",
+          "ok": true
+        },
+        {
+          "name": "memory_find",
+          "ok": true
+        },
+        {
+          "name": "memory_associate",
+          "ok": false,
+          "error": "INAPPLICABLE_MEMORY"
+        },
+        {
+          "name": "memory_associate",
+          "ok": false,
+          "error": "INAPPLICABLE_MEMORY"
+        },
+        {
+          "name": "memory_associate",
+          "ok": false,
+          "error": "INAPPLICABLE_MEMORY"
+        },
+        {
+          "name": "memory_associate",
+          "ok": false,
+          "error": "INAPPLICABLE_MEMORY"
+        },
+        {
+          "name": "memory_capture",
+          "ok": true
+        },
+        {
+          "name": "assistant_state",
+          "ok": true
+        }
+      ],
+      "reply": "",
+      "end": {
+        "turn": 1,
+        "reason": {
+          "kind": "aborted",
+          "reason": {
+            "kind": "user"
+          }
+        }
+      }
+    }
+  ],
+  "usage": {
+    "responses": 15,
+    "inputTokens": 7161,
+    "outputTokens": 4852,
+    "totalTokens": 53101,
+    "cacheReadTokens": 41088
+  },
+  "observations": [
+    {
+      "sessionId": "history-b9a23cc6-f985-4a63-aa61-d66bb417cfcb",
+      "sourceId": "87d80354-679d-4ca0-b53d-acce03753a33",
+      "name": "memory_find",
+      "args": {
+        "projectId": "d0f3ca8f-7a9e-4c6c-98dd-41fa2dcda924"
+      },
+      "requestId": "history-b9a23cc6-f985-4a63-aa61-d66bb417cfcb:call_00_79L1ORG5OOjLNdFyRm2d7192",
+      "ok": true,
+      "result": []
+    },
+    {
+      "sessionId": "history-b9a23cc6-f985-4a63-aa61-d66bb417cfcb",
+      "sourceId": "87d80354-679d-4ca0-b53d-acce03753a33",
+      "name": "memory_capture",
+      "args": {
+        "projectId": "d0f3ca8f-7a9e-4c6c-98dd-41fa2dcda924",
+        "payload": "{\"title\":\"室内活动签到前准备离线名单（2025-11-03 复盘）\",\"body\":\"2025 年 11 月 3 日的复盘写道：“室内活动签到前准备离线名单，可以在断网时继续核对来宾。”\",\"type\":\"method\",\"facts\":[{\"subject\":\"室内活动签到\",\"predicate\":\"准备工作\",\"value\":\"提前准备离线名单，断网时继续核对来宾\"}],\"topics\":[\"活动签到\",\"室内活动\",\"离线名单\"],\"requirements\":{\"venue\":\"indoor\",\"checkIn\":true,\"offlineList\":true},\"occurredAt\":\"2025-11-03\"}"
+      },
+      "requestId": "history-b9a23cc6-f985-4a63-aa61-d66bb417cfcb:call_00_8TwIugbBsPojpgVkTvUN8390",
+      "ok": true,
+      "result": {
+        "id": "355f57c7-88c8-4eec-b104-49bb40eeb090"
+      }
+    },
+    {
+      "sessionId": "history-b9a23cc6-f985-4a63-aa61-d66bb417cfcb",
+      "sourceId": "87d80354-679d-4ca0-b53d-acce03753a33",
+      "name": "memory_capture",
+      "args": {
+        "projectId": "d0f3ca8f-7a9e-4c6c-98dd-41fa2dcda924",
+        "payload": "{\"title\":\"举办室内活动时提前备好离线来宾名单（2025-11-04 补充复盘）\",\"body\":\"2025 年 11 月 4 日的补充复盘写道：“举办室内活动时，提前备好离线来宾名单，网络中断也能继续签到。”\",\"type\":\"method\",\"facts\":[{\"subject\":\"举办室内活动\",\"predicate\":\"准备工作\",\"value\":\"提前备好离线来宾名单，网络中断也能继续签到\"}],\"topics\":[\"活动签到\",\"室内活动\",\"离线名单\"],\"requirements\":{\"venue\":\"indoor\",\"checkIn\":true,\"offlineList\":true},\"occurredAt\":\"2025-11-04\"}"
+      },
+      "requestId": "history-b9a23cc6-f985-4a63-aa61-d66bb417cfcb:call_01_gyTuoEEqAahR97hbBcjg9436",
+      "ok": true,
+      "result": {
+        "id": "58000fad-4238-46d8-95a1-b8c4b850a9c0"
+      }
+    },
+    {
+      "sessionId": "history-b9a23cc6-f985-4a63-aa61-d66bb417cfcb",
+      "sourceId": "87d80354-679d-4ca0-b53d-acce03753a33",
+      "name": "memory_capture",
+      "args": {
+        "projectId": "d0f3ca8f-7a9e-4c6c-98dd-41fa2dcda924",
+        "payload": "{\"title\":\"离线名单中的重名人员仍需人工核对（2025-11-04）\",\"body\":\"当天还发现另一件事：“室内活动签到时，离线名单中的重名人员仍然需要人工核对。”\",\"type\":\"fact\",\"facts\":[{\"subject\":\"离线名单中的重名人员\",\"predicate\":\"签到处理方式\",\"value\":\"仍然需要人工核对\"}],\"topics\":[\"活动签到\",\"室内活动\",\"离线名单\",\"重名核对\"],\"requirements\":{\"venue\":\"indoor\",\"checkIn\":true,\"offlineList\":true},\"occurredAt\":\"2025-11-04\"}"
+      },
+      "requestId": "history-b9a23cc6-f985-4a63-aa61-d66bb417cfcb:call_02_uH2TnJM0oQb6TfVXS7sD4783",
+      "ok": true,
+      "result": {
+        "id": "04ef62e5-7363-4a7c-bfc4-f962c045d66f"
+      }
+    },
+    {
+      "sessionId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c",
+      "sourceId": "85050703-9e47-4321-a192-f0876ce129ad",
+      "name": "memory_find",
+      "args": {
+        "projectId": "6929c607-e3e6-4cb1-b460-7abf89f75a5b"
+      },
+      "requestId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c:call_00_ET_35CmpUZcLgSu00McC90o8237",
+      "ok": true,
+      "result": []
+    },
+    {
+      "sessionId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c",
+      "sourceId": "85050703-9e47-4321-a192-f0876ce129ad",
+      "name": "memory_associate",
+      "args": {
+        "projectId": "6929c607-e3e6-4cb1-b460-7abf89f75a5b",
+        "memories": "[{\"id\":\"355f57c7-88c8-4eec-b104-49bb40eeb090\",\"revision\":2},{\"id\":\"58000fad-4238-46d8-95a1-b8c4b850a9c0\",\"revision\":4},{\"id\":\"04ef62e5-7363-4a7c-bfc4-f962c045d66f\",\"revision\":6}]"
+      },
+      "requestId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c:call_00_j8jMYnbj71C384cQ2PSO6730",
+      "ok": false,
+      "error": "INAPPLICABLE_MEMORY"
+    },
+    {
+      "sessionId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c",
+      "sourceId": "85050703-9e47-4321-a192-f0876ce129ad",
+      "name": "memory_associate",
+      "args": {
+        "memories": "[{\"id\":\"58000fad-4238-46d8-95a1-b8c4b850a9c0\",\"revision\":4}]",
+        "projectId": "6929c607-e3e6-4cb1-b460-7abf89f75a5b"
+      },
+      "requestId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c:call_00_nBUXlYaZgnoOjKMmZdAa8690",
+      "ok": false,
+      "error": "INAPPLICABLE_MEMORY"
+    },
+    {
+      "sessionId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c",
+      "sourceId": "85050703-9e47-4321-a192-f0876ce129ad",
+      "name": "memory_associate",
+      "args": {
+        "memories": "[{\"id\":\"355f57c7-88c8-4eec-b104-49bb40eeb090\",\"revision\":2}]",
+        "projectId": "6929c607-e3e6-4cb1-b460-7abf89f75a5b"
+      },
+      "requestId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c:call_00_WdMZFgVirakvZJdiLPEL8054",
+      "ok": false,
+      "error": "INAPPLICABLE_MEMORY"
+    },
+    {
+      "sessionId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c",
+      "sourceId": "85050703-9e47-4321-a192-f0876ce129ad",
+      "name": "memory_associate",
+      "args": {
+        "memories": "[{\"id\":\"04ef62e5-7363-4a7c-bfc4-f962c045d66f\",\"revision\":6}]",
+        "projectId": "6929c607-e3e6-4cb1-b460-7abf89f75a5b"
+      },
+      "requestId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c:call_00_ET_AD2VUC1V7uvogmqgqMLa9744",
+      "ok": false,
+      "error": "INAPPLICABLE_MEMORY"
+    },
+    {
+      "sessionId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c",
+      "sourceId": "85050703-9e47-4321-a192-f0876ce129ad",
+      "name": "memory_capture",
+      "args": {
+        "projectId": "6929c607-e3e6-4cb1-b460-7abf89f75a5b",
+        "payload": "{\"title\":\"家庭聚会需在签到后发放儿童餐券（2026-11-03 确认）\",\"body\":\"这次家庭聚会有儿童参加，需要在签到后发放儿童餐券。\",\"type\":\"fact\",\"facts\":[{\"subject\":\"本次家庭聚会\",\"predicate\":\"儿童餐券发放时机\",\"value\":\"签到后发放，因有儿童参加\"}],\"topics\":[\"家庭聚会\",\"儿童餐券\",\"活动签到\"],\"requirements\":{\"venue\":\"indoor\",\"checkIn\":true},\"occurredAt\":\"2026-11-03\"}"
+      },
+      "requestId": "current-aca8dd88-3db9-4d44-a842-4feec0d1a78c:call_00_cixp2ioN64QFbBda2cZu8220",
+      "ok": true,
+      "result": {
+        "id": "062da1fd-671e-4fbc-a10f-fce5d10b863c"
+      }
+    }
+  ],
+  "stage": "initial-integration-before-context-validation-and-semantic-plans"
+}

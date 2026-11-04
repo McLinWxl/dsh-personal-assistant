@@ -1,0 +1,30 @@
+{
+  "verifiedAt": "2026-11-03T09:03:55.782Z",
+  "node": "v24.21.0",
+  "platform": "darwin",
+  "arch": "arm64",
+  "sqlite": "3.53.4",
+  "sourceHashes": {
+    "src/context-schema.mjs": "9063fd3914f50d969f1264eb1bdc4f63da922d29e8b1b2010a2716a631b0efe6",
+    "src/dsh-runtime.mjs": "215023288216a6944e160205363b654c63e94291da778b38ca8d10ad7e54ac39",
+    "src/fixtures.mjs": "5885f079ac125e0e43ad2834a30a3e571a10beb48d4f33736331b5fdb200cd68",
+    "src/host-plugin.mjs": "7b86bbfaa000f1965bdfdf9b6c5bf10c283bea5f96d6ffd9ea13511a02ffc95e",
+    "src/memory-store.mjs": "2b645f172994b2f8bdfdded528dae597ca96d8384982a896ea5627ede040b0ec",
+    "src/model-plugin.mjs": "4cd9cf07c6d93c5cd07bbcf7f4f9f2cdebccef2259de6fb0374d3bdcfbe913e2",
+    "src/scenario.mjs": "b15691e4df53be6b6f60a49078c218eceae3d750fbaa6f64416da60daae27d37",
+    "test/crash-worker.mjs": "b5260b97378b06b60d8be6742362e9140e42482b8f126d6c41856c50d6007903",
+    "test/lifecycle.test.mjs": "3cbda66065e2f183f7a20887d46165e58723c19ca03299605214f73477f55972",
+    "scripts/demo.mjs": "9f18cefba9c7fc915b1d59af6279952fd7fc005ebed443060aab0d0ddb9fd40d",
+    "scripts/live-model.mjs": "98bbe50381d6d6f78b47f4533a363e3fd201725efb14f0aacec32a2642ca5c1e",
+    "scripts/report.mjs": "a39279e2be0c72b352093acc8ac2a05e80152e3acf5214c5e5fd35176565ce46",
+    "scripts/run-dsh.mjs": "f4e1bc077fae615baf262863390f1c272bb2c1257b02077c04e5cdabc4c1ff8a",
+    "scripts/run-live.mjs": "785c8c8965521db59bcb732bcac539efdbd291ea4e47528a7834aaead8214a0c",
+    "scripts/verify-host.mjs": "4abe7412d032f5fcd957671b51af561c2e0a9cd01246edaed19b885dde4add8f",
+    "package.json": "ed312c042a852dcf21112db5178175125001c33f14679c6297609a0962462961"
+  },
+  "mode": "dsh-bundled-node",
+  "tests": 30,
+  "passed": 30,
+  "failed": 0,
+  "skipped": 0
+}

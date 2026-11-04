@@ -1,0 +1,13 @@
+{
+  "name": "dsh-personal-assistant-development",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.9.0" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs spikes/memory-lifecycle/test/lifecycle.test.mjs",
+    "release:check": "node scripts/release-config.mjs",
+    "release:pack": "node scripts/pack-release.mjs",
+    "release:publish": "node scripts/publish-release.mjs"
+  }
+}
