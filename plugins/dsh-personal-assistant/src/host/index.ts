@@ -26,6 +26,7 @@ export async function apply(ctx:PluginContext,config:PluginConfig){
    case'memory.manual':{const sourceId='manual:'+crypto.randomUUID();const {title,body,type,projectId,...extra}=payload;await service.storage.call('source',{id:sourceId,sessionId:'manual',role:'user' as const,text:body});return service.command('memoryCapture',{title,body,type,projectId,notes:extra.notes??'',domains:extra.domains??[],importance:extra.importance??3,pinned:extra.pinned??false,reusable:extra.reusable??false,facts:[{subject:title,predicate:'内容',value:body}],sourceId,quote:body,occurredAt:new Date().toISOString()},{kind:'ui'});}
    case'task.run':return service.run(payload);
    case'runs':return service.storage.call('runList');
+   case'report.generate':return service.generateReport({trigger:'manual'});
    case'maintenance.run':await service.storage.call('jobScheduleNow',{id:'memory-daily'});return{scheduled:true};
    case'jobs':return service.storage.call('jobList');
    case'data.export':await scheduler.stop();try{return await service.exportData(payload.destination);}finally{await scheduler.start();}

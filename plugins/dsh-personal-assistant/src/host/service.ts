@@ -12,9 +12,13 @@ import {StorageClient} from './storage-client.js';
 import {type Actor} from '../domain/contracts.js';
 import {ProjectLifecycle} from './project-lifecycle.js';
 import type {PluginContext,AgentHandle,OwnerSession,SessionEvent} from './context.js';
-import type {AssistantSettings,PendingSource,SourceRecord,MemoryHit,RecordPage,RunRow,JobRow,ToolRecord,MaintenanceCommand,ChangeDetails,ConversationRow,ConversationMessage,ProjectRef} from './storage-types.js';
+import type {AssistantSettings,PendingSource,SourceRecord,MemoryHit,RecordPage,RunRow,JobRow,ToolRecord,MaintenanceCommand,ChangeDetails,ConversationRow,ConversationMessage,ProjectRef,ReportWindowResult,SnapshotRecord} from './storage-types.js';
 export const PRESET='personal-assistant',REVIEW_PRESET='personal-assistant-maintenance';
 import {messageText,sourceFromEvent,isOwnerSession,isUserMessage,isReportTurn,REPORT_SOURCE} from './session-events.js';
+const reportKindLabels:Record<string,string>={memory:'记忆',project:'项目',task:'任务',event:'日程',tool:'工具',run:'执行',wechat:'微信',maintenance:'整理'};
+const reportActionLabels:Record<string,string>={created:'新增',updated:'更新',removed:'删除',merged:'归并',ran:'执行',failed:'失败',confirmed:'确认'};
+function reportChunks(text:string,size=1800){const lines=text.split('\n'),chunks:string[]=[];let current='';for(const line of lines){const next=current?current+'\n'+line:line;if(next.length>size&&current){chunks.push(current);current=line;}else current=next;}if(current)chunks.push(current);return chunks;}
+function reportCompact(value:any,max=12000){let text=JSON.stringify(value);if(text.length<=max)return text;const copy:any=JSON.parse(text);for(const key of Object.keys(copy.changedItems??{}))copy.changedItems[key]=copy.changedItems[key].slice(0,12);copy.openTasks=copy.openTasks.slice(0,12);copy.upcomingEvents=copy.upcomingEvents.slice(0,10);text=JSON.stringify(copy);if(text.length<=max)return text;for(const key of Object.keys(copy.changedItems??{}))copy.changedItems[key]=copy.changedItems[key].length;copy.upcomingEvents=[];text=JSON.stringify(copy);return text.length<=max?text:text.slice(0,max);}
 export class AssistantService {
  storage:StorageClient;
  projects=new ProjectLifecycle(this);
@@ -23,6 +27,7 @@ export class AssistantService {
  channel:any;
  assistantWorkspacePath='';
  reportRuns=new Set<string>();
+ private reportPending:Promise<any>|undefined;
  private observationTail:Promise<any>=Promise.resolve();
  workflowRuns=new Map<string,{id:string;version:string}>();
  private presetPromise:Promise<void>|undefined;
@@ -163,6 +168,57 @@ export class AssistantService {
    return session.sessionId;
   }finally{this.reportRuns.delete(agent.id);}
  }
+  async generateReport(options:{trigger:'schedule'|'manual'}={trigger:'schedule'}){
+   if(this.reportPending)return this.reportPending;
+   const run=this.buildReport(options).catch(async(e:any)=>{this.report(e);try{await this.storage.call('notify',{type:'report.failed',payload:{error:String(e?.message??e)}});}catch{}return null;});
+   this.reportPending=run;
+   try{return await run;}finally{if(this.reportPending===run)this.reportPending=undefined;}
+  }
+  private reportDate(ms:number,timezone:string){return new Intl.DateTimeFormat('en-CA',{timeZone:timezone,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(ms));}
+  private reportWeixinText(date:string,window:ReportWindowResult){
+   const items=Array.isArray(window.items)?window.items:[],lines=[`日报 ${date} · 共 ${items.length} 项变化`];
+   for(const item of items)lines.push(`【${reportKindLabels[item.kind]??item.kind}】${reportActionLabels[item.action]??item.action}：${(item.title||'未命名').replace(/\s+/g,' ').slice(0,40)}`);
+   if(!items.length)lines.push('本周期没有记录到变化。');
+   return lines.join('\n');
+  }
+  private async reportData(window:ReportWindowResult,settings:AssistantSettings,date:string){
+   const items=Array.isArray(window.items)?window.items:[],changedItems:Record<string,any[]>={};
+   for(const item of items){const list=changedItems[item.kind]??(changedItems[item.kind]=[]);if(list.length<60)list.push({title:item.title,action:item.action,detail:String(item.detail??'').slice(0,120),at:new Date(item.at).toISOString()});}
+   let openTasks:any[]=[],upcomingEvents:any[]=[],pendingSourceCount=0;
+   try{const page=await this.command('list',{kind:'task',limit:50});openTasks=(page?.items??[]).filter((t:any)=>!t.data?.completedAt&&!['completed','cancelled','done'].includes(t.data?.status)).slice(0,20).map((t:any)=>({title:t.data?.title,status:t.data?.status??'todo',dueAt:t.data?.dueAt??null,importance:t.data?.importance??3}));}catch(e){this.report(e);}
+   const now=Date.now();
+   try{const rows=await this.command('calendar',{from:new Date(now).toISOString(),to:new Date(now+3*86400000).toISOString()});upcomingEvents=(rows??[]).slice(0,20).map((r:any)=>({title:r.data?.title??r.title??'',start:r.occurrenceStart??'',end:r.occurrenceEnd??''}));}catch(e){this.report(e);}
+   try{pendingSourceCount=(await this.storage.call('pendingSources',{limit:20})).length;}catch(e){this.report(e);}
+   const openQuestions=openTasks.filter((t:any)=>['needs-review','unknown','blocked'].includes(String(t.status))).map((t:any)=>t.title);
+   return reportCompact({now:new Date(now).toISOString(),date,timezone:settings.timezone,window:{from:new Date(window.from).toISOString(),to:new Date(window.to).toISOString(),summary:window.summary},changedItems,openTasks,openQuestions,upcomingEvents,pendingSourceCount});
+  }
+  private async pushReport(reportId:string,text:string){
+   try{if(!this.channel)throw new Error('WEIXIN_NOT_CONNECTED');for(const chunk of reportChunks(text))await this.channel.sendText(chunk);}
+   catch(e:any){this.report(e);try{await this.storage.call('notify',{type:'report.push-failed',payload:{reportId,error:String(e?.message??e)}});}catch{}}
+  }
+  private async buildReport(options:{trigger:'schedule'|'manual'}){
+   const settings=await this.command('settingsGet',{});
+   if(options.trigger==='schedule'&&settings.reportEnabled===false)return null;
+   const window=await this.storage.call('reportWindow',{}) as ReportWindowResult,items=Array.isArray(window.items)?window.items:[];
+   const date=this.reportDate(Date.now(),settings.timezone),data=await this.reportData(window,settings,date);
+   let snapshotId:string|undefined;try{snapshotId=(await this.storage.call('snapshotTake',{}) as SnapshotRecord)?.id;}catch(e){this.report(e);}
+   const session=await this.createConversation('日报 · '+date,true);
+   const agent=this.ctx.agents.get(session.sessionId);if(!agent)throw new Error('SESSION_NOT_STARTED');this.reportRuns.add(agent.id);
+   let body='',messageId:string|undefined;
+   try{
+    const prompt='现在是 '+date+' 的日报时间。请基于下面的本周期数据，用中文写一份日报正文。只输出日报正文，不调用工具，不输出 JSON、代码块或额外说明。\n数据：\n'+data;
+    agent.followup(createUserMessage({content:[{type:'text',text:prompt}],source:{kind:REPORT_SOURCE}}));
+    const timer=setTimeout(()=>agent.cancel({kind:'user'},{keepInbox:true}),120000);try{await agent.whenIdle();}finally{clearTimeout(timer);}
+    const events=agent.session.snapshotEvents(),end=events.filter((e:any)=>e.type==='turn/end').at(-1);
+    if(end?.data?.reason?.kind!=='completed')throw new Error('REPORT_TURN_FAILED');
+    const assistant=[...events].reverse().find((e:any)=>e.type==='assistant/message');
+    body=messageText(assistant?.data?.message??{}).trim();messageId=assistant?.data?.message?.id;
+   }finally{this.reportRuns.delete(agent.id);}
+   if(!body)body=this.reportWeixinText(date,window);
+   const saved=await this.storage.call('reportSave',{from:window.from,to:window.to,summary:window.summary,items,sessionId:session.sessionId,messageId,snapshotId,body}) as {id:string};
+   await this.pushReport(saved.id,this.reportWeixinText(date,window));
+   return this.storage.call('reportGet',{id:saved.id});
+  }
  async maintenance(){if(this.maintenancePending)return{skipped:true,busy:true};this.maintenancePending=this.performMaintenance();try{return await this.maintenancePending;}catch(e:any){try{await this.publishReport({status:'failed',error:e.message,changesCommitted:e.changesCommitted??null});}catch(reportError){this.report(reportError);}throw e;}finally{this.maintenancePending=undefined;}}
  async captureProjects(){
   if(this.maintenancePending||this.directoryBusy)return{busy:true};

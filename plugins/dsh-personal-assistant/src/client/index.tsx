@@ -75,10 +75,8 @@ const LABELS: Record<string, string> = {
   cancelled: '已取消',
   failed: '失败',
   draft: '草稿',
-  applied: '可撤回',
+  applied: '已应用',
   expired: '已到期',
-  undone: '已撤回',
-  'undone-with-preserved-edits': '已撤回并保留修改',
 };
 
 const ERROR_LABELS: Record<string, string> = {
@@ -92,7 +90,6 @@ const ERROR_LABELS: Record<string, string> = {
   STALE_VERSION: '内容已更新，请刷新后重试。',
   QUOTE_NOT_IN_SOURCE: '引用与来源不一致。',
   DATA_DIRECTORY_LOCKED: '此目录正在使用。',
-  UNDO_EXPIRED: '撤回期限已到。',
   PROJECT_HAS_ACTIVE_REFERENCES: '项目仍有任务或日程，暂时不能删除。',
   VAULT_LOCKED: '请先解锁凭据。',
   VAULT_UNLOCK_FAILED: '口令不正确。',
@@ -334,15 +331,6 @@ interface Overview {
   settings: AssistantSettings;
 }
 
-interface Notification {
-  id: string;
-  type: string;
-  payload: Record<string, unknown>;
-  created_at: number;
-  read_at?: number | null;
-  changeStatus?: string | null;
-}
-
 interface ChangeSummary {
   type?: string;
   changedObjects?: number;
@@ -357,37 +345,55 @@ interface ChangeRecord {
   summary: ChangeSummary;
 }
 
-interface ChangeNode {
-  id?: string;
-  revision?: number;
-  data?: RowData;
-}
-
-interface FieldDelta {
-  name: string;
-  before: unknown;
-  after: unknown;
-}
-
-interface ChangeDelta {
-  tableName: string;
-  objectId: string;
-  before?: ChangeNode | null;
-  after?: ChangeNode | null;
-  fields?: FieldDelta[];
-}
-
 interface ChangeItem {
-  id: string;
-  before?: ChangeNode | null;
-  after?: ChangeNode | null;
-  fields?: FieldDelta[];
+  kind: string;
+  objectId: string | null;
+  title: string;
+  action: string;
+  detail: string;
 }
 
 interface ChangeDetail extends ChangeRecord {
   items: ChangeItem[];
-  deltas?: ChangeDelta[];
   expiresDisplay?: string;
+}
+
+type ReportStatus = 'draft' | 'confirmed' | 'auto-confirmed' | 'superseded';
+
+interface ReportRow {
+  id: string;
+  windowFrom: number;
+  windowTo: number;
+  status: ReportStatus;
+  revision: number;
+  conversationId: string | null;
+  sessionId: string | null;
+  body: string;
+  createdAt: number;
+  confirmedAt: number | null;
+  counts: number;
+  summary: Record<string, unknown> | null;
+}
+
+interface ReportItem {
+  id: string;
+  kind: string;
+  objectId: string | null;
+  action: string;
+  title: string;
+  detail: string;
+  at: number;
+}
+
+interface ReportRevision {
+  revision: number;
+  body: string;
+  createdAt: number;
+}
+
+interface ReportDetail extends ReportRow {
+  items: ReportItem[];
+  revisions: ReportRevision[];
 }
 
 interface Relation {
@@ -534,7 +540,18 @@ interface AssistantSettings {
   model: string;
   basePreset: string;
   workspace: string;
+  reportEnabled: boolean;
+  reportHour: number;
+  snapshotDays: number;
+  changeSummaryDays: number;
 }
+
+const REPORT_SETTING_DEFAULTS = {
+  reportEnabled: true,
+  reportHour: 7,
+  snapshotDays: 7,
+  changeSummaryDays: 90,
+};
 
 interface SettingsOptions {
   models: Array<{ id: string; name: string }>;
@@ -1261,7 +1278,7 @@ type TabId =
   | 'calendar'
   | 'task'
   | 'tool'
-  | 'inbox'
+  | 'report'
   | 'settings';
 
 type Kind = 'memory' | 'project' | 'task' | 'tool' | 'event';
@@ -1273,7 +1290,7 @@ const NAV_TABS: Array<{ id: TabId; label: string }> = [
   { id: 'calendar', label: '日历' },
   { id: 'task', label: '任务' },
   { id: 'tool', label: '工具' },
-  { id: 'inbox', label: '收件箱' },
+  { id: 'report', label: '日报' },
 ];
 
 function kindLabel(kind: Kind): string {
@@ -1995,7 +2012,7 @@ function RecordDialog({
                 <p className="pa-detail-note">暂无关联。</p>
               )}
             </section>
-            {row && <RecordHistory api={api} id={row.id} onChanged={() => void refreshRecord()} />}
+            {row && <RecordHistory api={api} id={row.id} />}
             {error && <div role="alert" className="pa-error">{error}</div>}
           </div>
           <footer className="pa-dialog-footer">
@@ -2081,7 +2098,7 @@ function RecordDialog({
                 ))
               )}
             </section>
-            {row && <RecordHistory api={api} id={row.id} onChanged={() => void refreshRecord()} />}
+            {row && <RecordHistory api={api} id={row.id} />}
             {error && <div role="alert" className="pa-error">{error}</div>}
           </div>
           <footer className="pa-dialog-footer">
@@ -2241,28 +2258,28 @@ function RecordDialog({
 /* Record history (recent changes touching one node)                   */
 /* ------------------------------------------------------------------ */
 
-function shortValue(value: unknown): string {
-  if (value === null || value === undefined || value === '') return '—';
-  const text = typeof value === 'string' ? value : JSON.stringify(value);
-  if (text === undefined) return '—';
-  return text.length > 80 ? `${text.slice(0, 80)}…` : text;
+function changeActionLabel(action: string): string {
+  if (action === 'created') return '创建';
+  if (action === 'updated') return '更新';
+  if (action === 'deleted') return '删除';
+  if (action === 'merged') return '合并';
+  return action || '变更';
+}
+
+function changeStatusLabel(status: string): string {
+  return status === 'applied' ? '已应用' : '已归档';
 }
 
 function RecordHistory({
   api,
   id,
-  onChanged,
 }: {
   api: Api;
   id: string;
-  onChanged: () => void;
 }) {
-  const notify = useToast();
-  const confirm = useConfirm();
   const [entries, setEntries] = useState<Array<{ change: ChangeDetail; item: ChangeItem }>>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [busy, setBusy] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -2277,11 +2294,9 @@ function RecordHistory({
       const found: Array<{ change: ChangeDetail; item: ChangeItem }> = [];
       for (const detail of details) {
         if (!detail) continue;
-        const item = (detail.items ?? []).find(
-          (entry) =>
-            entry.id === id || entry.before?.id === id || entry.after?.id === id,
-        );
-        if (item) found.push({ change: detail, item });
+        for (const item of detail.items ?? []) {
+          if (item.objectId === id) found.push({ change: detail, item });
+        }
       }
       setEntries(found);
       setError('');
@@ -2295,26 +2310,6 @@ function RecordHistory({
   useEffect(() => {
     void load();
   }, [load]);
-
-  const undo = async (change: ChangeRecord) => {
-    const ok = await confirm({
-      title: '撤回这次变更？',
-      body: '将把相关记录恢复到变更前的状态，已保留的编辑可能会被一并撤销。',
-      confirmLabel: '撤回',
-    });
-    if (!ok) return;
-    setBusy(change.id);
-    try {
-      await command(api, 'undo', { id: change.id });
-      notify('已撤回');
-      await load();
-      onChanged();
-    } catch (err) {
-      notify(message(err), { tone: 'error' });
-    } finally {
-      setBusy('');
-    }
-  };
 
   if (loading) {
     return (
@@ -2338,51 +2333,21 @@ function RecordHistory({
       {entries.length === 0 ? (
         <p className="pa-detail-note">最近没有涉及这条记录的整理变更。</p>
       ) : (
-        entries.map(({ change, item }) => {
-          const canUndo =
-            change.status === 'applied' &&
-            (!change.expiresAt || change.expiresAt > Date.now());
-          return (
-            <article key={change.id} className="pa-history-entry">
-              <div className="pa-card-head">
-                <div>
-                  <h3>
-                    {item.before && !item.after
-                      ? '删除了这条记录'
-                      : !item.before && item.after
-                        ? '创建了这条记录'
-                        : '编辑了这条记录'}
-                  </h3>
-                  <p className="pa-meta">
-                    {formatDate(change.createdAt)} ·{' '}
-                    {LABELS[change.status] ?? change.status}
-                  </p>
-                </div>
-                {canUndo && (
-                  <button
-                    type="button"
-                    disabled={busy === change.id}
-                    onClick={() => void undo(change)}
-                  >
-                    {busy === change.id ? '撤回中…' : '撤回'}
-                  </button>
-                )}
-              </div>
-              {(item.fields ?? []).length > 0 && (
-                <div className="pa-history-fields">
-                  {(item.fields ?? []).map((field) => (
-                    <div key={field.name} className="pa-history-field">
-                      <span>{FIELD_LABELS[field.name] ?? field.name}</span>
-                      <s>{shortValue(field.before)}</s>
-                      <em>→</em>
-                      <b>{shortValue(field.after)}</b>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </article>
-          );
-        })
+        entries.map(({ change, item }, index) => (
+          <article
+            key={`${change.id}:${item.objectId ?? index}:${index}`}
+            className="pa-history-entry"
+          >
+            <div className="pa-card-head">
+              <h3>{item.title || '这条记录'}</h3>
+              <span className="pa-tag">{changeActionLabel(item.action)}</span>
+            </div>
+            <p className="pa-meta">
+              {formatDate(change.createdAt)} · {changeStatusLabel(change.status)}
+            </p>
+            {item.detail && <p className="pa-detail-note">{item.detail}</p>}
+          </article>
+        ))
       )}
       <p className="pa-meta">仅显示最近 12 条整理记录中涉及这条记录的变更。</p>
     </section>
@@ -2570,7 +2535,7 @@ function CommandPalette({
     { id: 'calendar', label: '切换到 日历', run: () => onNavigate('calendar') },
     { id: 'task', label: '切换到 任务', run: () => onNavigate('task') },
     { id: 'tool', label: '切换到 工具', run: () => onNavigate('tool') },
-    { id: 'inbox', label: '切换到 收件箱', run: () => onNavigate('inbox') },
+    { id: 'report', label: '切换到 日报', run: () => onNavigate('report') },
     { id: 'settings', label: '切换到 设置', run: () => onNavigate('settings') },
     { id: 'new-memory', label: '新建记忆', run: onCreateMemory },
     { id: 'maintain', label: '立即整理', run: onMaintain },
@@ -3001,7 +2966,7 @@ function DataHealth({ api, root }: { api: Api; root: string }) {
             {stat('节点', nodes)}
             {stat('边', edges)}
             {stat('整理记录', changes)}
-            {stat('可撤回', rollback)}
+            {stat('恢复点', rollback)}
             {stat('待发通知', outbox)}
             <div className="pa-health-stat pa-health-path">
               <span>数据目录</span>
@@ -4571,573 +4536,518 @@ function Calendar({
 }
 
 /* ------------------------------------------------------------------ */
-/* Change dialog                                                       */
+/* 日报                                                                */
 /* ------------------------------------------------------------------ */
 
-const FIELD_LABELS: Record<string, string> = {
-  title: '名称',
-  body: '正文',
-  goal: '目标',
-  description: '描述',
-  notes: '备注',
-  domains: '领域',
-  topics: '主题',
-  pinned: '固定',
-  importance: '重要性',
-  status: '状态',
-  type: '类别',
-  facts: '事实',
-  canonicalFacts: '事实提炼',
-  derivedDirty: '整理状态',
-  reusable: '可复用',
-  dueAt: '截止时间',
-  projectId: '项目',
-  location: '地点',
+const REPORT_STATUS_LABEL: Record<ReportStatus, string> = {
+  draft: '待确认',
+  confirmed: '已确认',
+  'auto-confirmed': '已确认',
+  superseded: '已归档',
 };
 
-function displayValue(value: unknown): string {
-  if (value === null || value === undefined) return '无';
-  if (typeof value === 'string') return value || '空';
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  if (Array.isArray(value)) return value.map(displayValue).join('、');
-  return JSON.stringify(value, null, 2);
+const REPORT_KIND_LABEL: Record<string, string> = {
+  memory: '记忆',
+  project: '项目',
+  task: '任务',
+  event: '日程',
+  calendar: '日程',
+  tool: '工具',
+  entity: '实体',
+  notification: '通知',
+};
+
+function reportKindLabel(kind: string): string {
+  return REPORT_KIND_LABEL[kind] ?? (kind || '其他');
 }
 
-function nodeTitle(node: ChangeNode | null | undefined): string {
-  return node?.data?.title ?? '关联项';
+function reportDay(value: number, timezone: string): string {
+  const ms = typeof value === 'number' ? value : Date.parse(String(value ?? ''));
+  if (!Number.isFinite(ms)) return '';
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+  }).format(new Date(ms));
 }
 
-function fallbackNodeText(node: ChangeNode | null | undefined): string {
-  if (!node) return '无';
-  const data = node.data ?? {};
-  return (
-    data.body ??
-    data.goal ??
-    data.description ??
-    (data.title ? data.title : '关联已存在')
-  );
-}
-
-function DiffTable({ fields }: { fields: FieldDelta[] }) {
-  return (
-    <div className="pa-diff">
-      <div className="pa-diff-head">
-        <span>字段</span>
-        <span>修改前</span>
-        <span>修改后</span>
-      </div>
-      {fields.map((field) => (
-        <div className="pa-diff-row" key={field.name}>
-          <span className="pa-diff-name">
-            {FIELD_LABELS[field.name] ?? field.name}
-          </span>
-          <span>{displayValue(field.before)}</span>
-          <span>{displayValue(field.after)}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function FallbackDiff({
-  before,
-  after,
-}: {
-  before: ChangeNode | null | undefined;
-  after: ChangeNode | null | undefined;
-}) {
-  return (
-    <div className="pa-grid2">
-      <div>
-        <div className="pa-meta">修改前</div>
-        <p>{fallbackNodeText(before)}</p>
-      </div>
-      <div>
-        <div className="pa-meta">修改后</div>
-        <p>{fallbackNodeText(after)}</p>
-      </div>
-    </div>
-  );
-}
-
-function ChangeDetailsDialog({
-  api,
-  changeId,
-  onClose,
-}: {
-  api: Api;
-  changeId: string;
-  onClose: () => void;
-}) {
-  const [detail, setDetail] = useState<ChangeDetail | null>(null);
-  const [error, setError] = useState('');
-  useEffect(() => {
-    let live = true;
-    void command<ChangeDetail>(api, 'change', { id: changeId })
-      .then((value) => {
-        if (live) setDetail(value);
-      })
-      .catch((errorValue) => {
-        if (live) setError(message(errorValue));
-      });
-    return () => {
-      live = false;
-    };
-  }, [api, changeId]);
-  const deltas = detail?.deltas ?? [];
-  const items = detail?.items ?? [];
-  const fieldsById = new Map<string, FieldDelta[]>();
-  for (const item of items) {
-    if (item.fields && item.fields.length > 0) {
-      fieldsById.set(item.id, item.fields);
+function reportBreakdown(row: ReportRow): {
+  memory: number;
+  project: number;
+  task: number;
+  event: number;
+  other: number;
+} {
+  const summary = (row.summary ?? {}) as Record<string, unknown>;
+  const nested = summary.byKind ?? summary.counts ?? summary.items;
+  const source =
+    nested && typeof nested === 'object' && !Array.isArray(nested)
+      ? (nested as Record<string, unknown>)
+      : summary;
+  const read = (...keys: string[]): number => {
+    for (const key of keys) {
+      const value = source[key];
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
     }
-  }
+    return 0;
+  };
+  const memory = read('memory', 'memories');
+  const project = read('project', 'projects');
+  const task = read('task', 'tasks');
+  const event = read('event', 'events', 'calendar');
+  const known = memory + project + task + event;
+  const reported = Number.isFinite(row.counts) ? row.counts : 0;
+  const total = reported > 0 ? reported : known;
+  const explicitOther = read('other', 'others', 'remaining');
+  const other = explicitOther || Math.max(0, total - known);
+  return { memory, project, task, event, other };
+}
+
+function reportCountsText(row: ReportRow): string {
+  const counts = reportBreakdown(row);
+  const total = Number.isFinite(row.counts) ? row.counts : 0;
+  if (total <= 0) return '这份日报没有明细。';
+  const known = counts.memory + counts.project + counts.task + counts.event + counts.other;
+  if (known <= 0) return `共 ${total} 项`;
+  return `共 ${total} 项：记忆 ${counts.memory} · 项目 ${counts.project} · 任务 ${counts.task} · 日程 ${counts.event} · 其余 ${counts.other}`;
+}
+
+function ReportBody({ body }: { body: string }) {
+  const lines = (body ?? '').split(/\r?\n/);
   return (
-    <Modal title="变更详情" onClose={onClose} wide>
-      <div className="pa-detail">
-        {!detail && !error && <p className="pa-meta">加载中…</p>}
-        {detail && detail.expiresDisplay && (
-          <p className="pa-meta">撤回截止 {detail.expiresDisplay}</p>
-        )}
-        {error && <div role="alert" className="pa-error">{error}</div>}
-        {deltas.map((delta) => {
-          const fields = delta.fields?.length
-            ? delta.fields
-            : fieldsById.get(delta.objectId);
-          return (
-            <article key={`${delta.tableName}:${delta.objectId}`}>
-              <div className="pa-card-head">
-                <h3>{nodeTitle(delta.after ?? delta.before)}</h3>
-                <span className="pa-tag">{delta.tableName}</span>
-              </div>
-              {fields && fields.length > 0 ? (
-                <DiffTable fields={fields} />
-              ) : (
-                <FallbackDiff before={delta.before} after={delta.after} />
-              )}
-            </article>
+    <div className="pa-report-body">
+      {lines.map((line, index) => {
+        const text = line.trim();
+        if (!text) return null;
+        const heading = /^(#{1,4})\s+(.*)$/.exec(text);
+        if (heading) {
+          return heading[1].length <= 2 ? (
+            <h3 key={index}>{heading[2]}</h3>
+          ) : (
+            <h4 key={index}>{heading[2]}</h4>
           );
-        })}
-        {deltas.length === 0 &&
-          items.map((item) => (
-            <article key={item.id}>
-              <h3>{nodeTitle(item.after ?? item.before)}</h3>
-              {item.fields && item.fields.length > 0 ? (
-                <DiffTable fields={item.fields} />
-              ) : (
-                <FallbackDiff before={item.before} after={item.after} />
-              )}
-            </article>
-          ))}
-      </div>
-    </Modal>
+        }
+        if (text.startsWith('- ') || text.startsWith('• ')) {
+          return (
+            <div className="pa-report-li" key={index}>
+              {text.slice(2)}
+            </div>
+          );
+        }
+        return <p key={index}>{text}</p>;
+      })}
+    </div>
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* Inbox                                                               */
-/* ------------------------------------------------------------------ */
+function ReportItemsTable({ items }: { items: ReportItem[] }) {
+  return (
+    <div className="pa-report-table-wrap">
+      <table className="pa-report-table">
+        <thead>
+          <tr>
+            <th scope="col">类型</th>
+            <th scope="col">标题</th>
+            <th scope="col">详情</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((item) => (
+            <tr key={item.id}>
+              <td>
+                <span className="pa-tag">{reportKindLabel(item.kind)}</span>
+              </td>
+              <td>
+                {item.title || '未命名'}
+                {item.action && <span className="pa-meta"> · {changeActionLabel(item.action)}</span>}
+              </td>
+              <td className="pa-meta">{item.detail || '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
-interface InboxProps {
+interface ReportPageProps {
   api: Api;
   timezone: string;
-  onChange: () => void;
+  wide: boolean;
 }
 
-function Inbox({ api, timezone, onChange }: InboxProps) {
-  const [rows, setRows] = useState<Notification[]>([]);
-  const [changes, setChanges] = useState<ChangeRecord[]>([]);
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const [view, setView] = useState<'notifications' | 'changes'>('notifications');
-  const [detailId, setDetailId] = useState<string | null>(null);
-  const [error, setError] = useState('');
-  const [busyKey, setBusyKey] = useState('');
+function ReportPage({ api, timezone, wide }: ReportPageProps) {
   const notify = useToast();
   const confirm = useConfirm();
+  const [rows, setRows] = useState<ReportRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<ReportDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState('');
+  const [version, setVersion] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState('');
+  const [generating, setGenerating] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const fetchedRevision = useRef<number | null>(null);
+  const requestedDetail = useRef<string | null>(null);
 
-  const refresh = useCallback(async () => {
-    const [nextJobs, nextRows, nextChanges] = await Promise.all([
-      api<Job[]>('jobs'),
-      command<Notification[]>(api, 'inbox'),
-      command<ChangeRecord[]>(api, 'changes'),
-    ]);
-    setJobs(nextJobs);
-    setRows(nextRows);
-    setChanges(nextChanges);
-  }, [api]);
-
-  useEffect(() => {
-    refresh().catch((errorValue) => setError(message(errorValue)));
-  }, [refresh]);
-  usePolling(async () => {
-    try {
-      await refresh();
-    } catch {
-      // Polling failures stay quiet; the inline error is shown on explicit actions.
-    }
-  }, 3000);
-
-  const maintenanceRunning = jobs.some(
-    (job) => job.kind === 'memory' && job.status === 'running',
+  const loadList = useCallback(
+    async (nextOffset = offset) => {
+      try {
+        const result = await command<{ items: ReportRow[]; total: number }>(api, 'reportList', {
+          offset: nextOffset,
+          limit: 30,
+        });
+        setRows(result.items ?? []);
+        setTotal(result.total ?? (result.items ?? []).length);
+        setError('');
+      } catch (err) {
+        setError(message(err));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [api, offset],
   );
 
-  const runMaintenance = async () => {
-    setBusyKey('maintain');
-    setError('');
-    try {
-      await api('maintenance.run', { requestId: crypto.randomUUID() });
-      notify('已加入整理队列');
-      await refresh();
-      onChange();
-    } catch (errorValue) {
-      const mapped = message(errorValue);
-      setError(mapped);
-      notify(mapped, { tone: 'error' });
-    } finally {
-      setBusyKey('');
-    }
-  };
-
-  const readOne = async (notification: Notification) => {
-    setBusyKey(`read:${notification.id}`);
-    try {
-      await command(api, 'inboxRead', { id: notification.id });
-      notify('已标为已读');
-      await refresh();
-      onChange();
-    } catch (errorValue) {
-      const mapped = message(errorValue);
-      setError(mapped);
-      notify(mapped, { tone: 'error' });
-    } finally {
-      setBusyKey('');
-    }
-  };
-
-  const readAll = async () => {
-    const unread = rows.filter((row) => !row.read_at);
-    if (unread.length === 0) return;
-    setBusyKey('read-all');
-    setError('');
-    try {
-      for (const row of unread) {
-        await command(api, 'inboxRead', { id: row.id });
+  const loadDetail = useCallback(
+    async (id: string) => {
+      requestedDetail.current = id;
+      setDetailLoading(true);
+      setDetailError('');
+      try {
+        const next = await command<ReportDetail>(api, 'reportGet', { id });
+        if (requestedDetail.current !== id) return;
+        setDetail(next);
+        setVersion(next.revision);
+      } catch (err) {
+        if (requestedDetail.current !== id) return;
+        setDetailError(message(err));
+      } finally {
+        if (requestedDetail.current === id) setDetailLoading(false);
       }
-      notify('已全部已读');
-      await refresh();
-      onChange();
-    } catch (errorValue) {
-      const mapped = message(errorValue);
-      setError(mapped);
-      notify(mapped, { tone: 'error' });
-    } finally {
-      setBusyKey('');
+    },
+    [api],
+  );
+
+  useEffect(() => {
+    void loadList();
+  }, [loadList]);
+
+  usePolling(
+    async () => {
+      await loadList();
+    },
+    15000,
+    !generating,
+  );
+
+  useEffect(() => {
+    if (!generating) return;
+    const started = Date.now();
+    setElapsed(0);
+    const timer = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - started) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [generating]);
+
+  useEffect(() => {
+    if (!selectedId) {
+      requestedDetail.current = null;
+      setDetail(null);
+      setVersion(null);
+      return;
     }
+    setDetail(null);
+    setVersion(null);
+    fetchedRevision.current = null;
+    void loadDetail(selectedId);
+  }, [selectedId, loadDetail]);
+
+  const selectedRow = rows.find((row) => row.id === selectedId) ?? null;
+  const selectedRevision = selectedRow?.revision ?? null;
+  useEffect(() => {
+    if (!selectedId || !detail || detail.id !== selectedId) return;
+    if (selectedRevision === null || selectedRevision <= detail.revision) return;
+    if (fetchedRevision.current === selectedRevision) return;
+    fetchedRevision.current = selectedRevision;
+    void loadDetail(selectedId);
+  }, [selectedId, selectedRevision, detail, loadDetail]);
+
+  const openReport = (row: ReportRow) => {
+    if (row.sessionId) {
+      void api('native.open', { sessionId: row.sessionId });
+      return;
+    }
+    notify('这份日报还没有关联会话。', { tone: 'error' });
   };
 
-  const undo = async (change: ChangeRecord, after?: () => void) => {
+  const confirmReport = async (row: ReportRow) => {
     const ok = await confirm({
-      title: '撤回这次整理？',
-      body: `将撤回整理记录「${change.id.slice(0, 8)}」中的 ${change.summary.changedObjects ?? 0} 项变更，相关记忆会恢复到整理前；之后的人工修改会保留。`,
-      confirmLabel: '撤回',
+      title: '确认这份日报？',
+      body: `确认后「${reportDay(row.windowFrom, timezone)} – ${reportDay(row.windowTo, timezone)}」的日报会标记为已确认。`,
+      confirmLabel: '确认',
     });
     if (!ok) return;
-    setBusyKey(`undo:${change.id}`);
+    setBusy(`confirm:${row.id}`);
+    try {
+      const next = await command<ReportRow>(api, 'reportConfirm', { id: row.id });
+      setRows((current) =>
+        current.map((item) =>
+          item.id === row.id
+            ? { ...item, ...next, summary: next.summary ?? item.summary }
+            : item,
+        ),
+      );
+      notify('已确认');
+      await loadList();
+      if (selectedId === row.id) await loadDetail(row.id);
+    } catch (err) {
+      notify(message(err), { tone: 'error' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const generate = async () => {
+    setGenerating(true);
     setError('');
     try {
-      await command(api, 'undo', { id: change.id });
-      await refresh();
-      onChange();
-      after?.();
-      notify('已撤回整理', {
-        action: {
-          label: '撤销撤回',
-          run: async () => {
-            await command(api, 'redo', { id: change.id });
-            await refresh();
-            onChange();
-            notify('已恢复整理');
-          },
-        },
-      });
-    } catch (errorValue) {
-      const mapped = message(errorValue);
+      const created = await api<{ id?: string; revision?: number; error?: { message?: string } }>(
+        'report.generate',
+        { force: true },
+      );
+      if (!created?.id) {
+        throw new Error(created?.error?.message ?? '生成失败，请稍后再试。');
+      }
+      setOffset(0);
+      await loadList(0);
+      setSelectedId(created.id);
+      let next: ReportDetail | null = null;
+      try {
+        next = await command<ReportDetail>(api, 'reportGet', { id: created.id });
+      } catch {
+        // The detail effect retries; generation itself succeeded.
+      }
+      if (next) {
+        setDetail(next);
+        setVersion(next.revision);
+      }
+      if (next?.sessionId) {
+        const sessionId = next.sessionId;
+        void api('native.open', { sessionId });
+        notify('已生成，正在打开', {
+          action: { label: '打开会话', run: () => void api('native.open', { sessionId }) },
+        });
+      } else {
+        notify('已生成');
+      }
+    } catch (err) {
+      const mapped = message(err);
       setError(mapped);
       notify(mapped, { tone: 'error' });
     } finally {
-      setBusyKey('');
+      setGenerating(false);
     }
   };
 
-  const redo = async (change: ChangeRecord) => {
-    setBusyKey(`redo:${change.id}`);
-    setError('');
-    try {
-      await command(api, 'redo', { id: change.id });
-      await refresh();
-      onChange();
-      notify('已重做整理');
-    } catch (errorValue) {
-      const mapped = message(errorValue);
-      setError(mapped);
-      notify(mapped, { tone: 'error' });
-    } finally {
-      setBusyKey('');
-    }
+  const renderDetail = (row: ReportRow) => {
+    const active = detail && detail.id === row.id ? detail : null;
+    const versions = active?.revisions ?? [];
+    const currentVersion = versions.find((item) => item.revision === version);
+    const body = currentVersion?.body ?? active?.body ?? row.body;
+    const items = active?.items ?? [];
+    return (
+      <div className="pa-report-detail-content">
+        <div className="pa-report-detail-meta">
+          <span className={cx('pa-tag', `pa-report-tag-${row.status}`)}>
+            {REPORT_STATUS_LABEL[row.status] ?? row.status}
+          </span>
+          <span className="pa-meta">修订 #{row.revision}</span>
+          <span className="pa-meta">生成于 {formatDate(row.createdAt, timezone)}</span>
+          {row.confirmedAt && (
+            <span className="pa-meta">确认于 {formatDate(row.confirmedAt, timezone)}</span>
+          )}
+        </div>
+        {versions.length > 1 && (
+          <label className="pa-report-version">
+            <span>版本</span>
+            <select
+              value={version ?? row.revision}
+              onChange={(event) => setVersion(Number(event.target.value))}
+            >
+              {[...versions]
+                .sort((a, b) => b.revision - a.revision)
+                .map((item) => (
+                  <option key={item.revision} value={item.revision}>
+                    修订 #{item.revision} · {formatDate(item.createdAt, timezone)}
+                  </option>
+                ))}
+            </select>
+          </label>
+        )}
+        {detailLoading && !active && <p className="pa-meta">正在读取日报…</p>}
+        {detailError && (
+          <div role="alert" className="pa-error">
+            {detailError}
+          </div>
+        )}
+        {body ? <ReportBody body={body} /> : <p className="pa-detail-note">这份日报还没有正文。</p>}
+        {items.length > 0 && (
+          <section className="pa-report-items">
+            <h3>
+              明细<span className="pa-count">{items.length}</span>
+            </h3>
+            {items.length > 30 ? (
+              <details className="pa-report-all">
+                <summary>全部 {items.length} 项</summary>
+                <ReportItemsTable items={items} />
+              </details>
+            ) : (
+              <ReportItemsTable items={items} />
+            )}
+          </section>
+        )}
+        <div className="pa-report-detail-actions">
+          <button type="button" className="pa-text-button" onClick={() => openReport(row)}>
+            打开会话
+          </button>
+          {row.status === 'draft' && (
+            <button
+              type="button"
+              className="pa-primary"
+              disabled={busy !== ''}
+              onClick={() => void confirmReport(row)}
+            >
+              {busy === `confirm:${row.id}` ? '确认中…' : '确认这份'}
+            </button>
+          )}
+        </div>
+      </div>
+    );
   };
 
-  const allowMerge = async (change: ChangeRecord) => {
-    setBusyKey(`merge:${change.id}`);
-    try {
-      await command(api, 'allowMerge', { id: change.id });
-      notify('已允许再次归并');
-      await refresh();
-      onChange();
-    } catch (errorValue) {
-      const mapped = message(errorValue);
-      setError(mapped);
-      notify(mapped, { tone: 'error' });
-    } finally {
-      setBusyKey('');
-    }
-  };
+  const cards = rows.map((row) => (
+    <article
+      className={cx('pa-card pa-report-card', selectedId === row.id && 'pa-card-checked')}
+      key={row.id}
+    >
+      <div className="pa-card-head">
+        <h3 className="pa-title">
+          {reportDay(row.windowFrom, timezone)} – {reportDay(row.windowTo, timezone)}
+        </h3>
+        <span className={cx('pa-tag', `pa-report-tag-${row.status}`)}>
+          {REPORT_STATUS_LABEL[row.status] ?? row.status}
+        </span>
+      </div>
+      <p className="pa-meta">修订 #{row.revision} · 生成于 {formatDate(row.createdAt, timezone)}</p>
+      <p className="pa-report-counts">{reportCountsText(row)}</p>
+      <footer>
+        <button type="button" className="pa-text-button" onClick={() => setSelectedId(row.id)}>
+          查看
+        </button>
+        <button type="button" className="pa-text-button" onClick={() => openReport(row)}>
+          打开会话
+        </button>
+        {row.status === 'draft' && (
+          <button
+            type="button"
+            className="pa-text-button"
+            disabled={busy !== ''}
+            onClick={() => void confirmReport(row)}
+          >
+            {busy === `confirm:${row.id}` ? '确认中…' : '确认这份'}
+          </button>
+        )}
+      </footer>
+    </article>
+  ));
 
-  const notificationLabel = (type: string): string => {
-    if (type === 'project.created') return '项目已创建';
-    if (type === 'project.recognized') return '已关联项目';
-    if (type === 'project.review-needed') return '项目待确认';
-    if (type.includes('failed')) return '处理失败';
-    if (type.startsWith('reminder')) return '到期提醒';
-    if (type === 'maintenance.completed') return '整理完成';
-    if (type.startsWith('task')) return '任务更新';
-    if (type.startsWith('tool')) return '工具更新';
-    return '内容已更新';
-  };
-
-  const groups = useMemo(() => {
-    const result: Array<{ title: string; items: Notification[] }> = [];
-    const today = dayString(timezone, 0);
-    const yesterday = dayString(timezone, -1);
-    for (const notification of rows) {
-      const key = dayKeyOf(notification.created_at, timezone);
-      const title = key === today ? '今天' : key === yesterday ? '昨天' : '更早';
-      const group = result.find((item) => item.title === title);
-      if (group) group.items.push(notification);
-      else result.push({ title, items: [notification] });
-    }
-    return result;
-  }, [rows, timezone]);
-
-  const unreadCount = rows.filter((row) => !row.read_at).length;
+  const selected = detail && detail.id === selectedId ? detail : selectedRow;
 
   return (
-    <>
-      <div className="pa-toolbar">
-        <h2>收件箱</h2>
-        <button
-          type="button"
-          disabled={busyKey !== '' || unreadCount === 0}
-          onClick={() => void readAll()}
-        >
-          {busyKey === 'read-all' ? '处理中…' : '全部已读'}
-        </button>
-        <button
-          type="button"
-          disabled={busyKey !== '' || maintenanceRunning}
-          onClick={() => void runMaintenance()}
-        >
-          {maintenanceRunning || busyKey === 'maintain' ? '整理中…' : '立即整理'}
-        </button>
-      </div>
-      <div className="pa-segments">
-        <button
-          type="button"
-          className={view === 'notifications' ? 'pa-selected' : ''}
-          onClick={() => setView('notifications')}
-        >
-          通知
-        </button>
-        <button
-          type="button"
-          className={view === 'changes' ? 'pa-selected' : ''}
-          onClick={() => setView('changes')}
-        >
-          整理记录
-        </button>
-      </div>
-      {error && <div className="pa-error" role="alert">{error}</div>}
-      {view === 'changes' && (
-        <div className="pa-records">
-          {changes.length === 0 && (
-            <EmptyState text="暂无整理记录" actionLabel="立即整理" onAction={() => void runMaintenance()} />
+    <div className={cx('pa-report-page', wide && 'pa-page-wide')}>
+      <div className="pa-page-heading">
+        <div>
+          <h2>日报</h2>
+          <p className="pa-meta">每天 07:00 自动生成；在日报会话里回复，助手会修订内容。</p>
+        </div>
+        <div className="pa-actions">
+          {generating && (
+            <span className="pa-meta pa-report-progress" role="status">
+              生成中…（可能需要 1–2 分钟）· {elapsed}s
+            </span>
           )}
-          {changes.map((change) => (
-            <article className="pa-card" key={change.id}>
-              <div className="pa-card-head">
-                <strong>{change.summary.type ? '内容变更' : '记忆整理'}</strong>
-                <span className="pa-tag">{LABELS[change.status] ?? change.status}</span>
-              </div>
-              <div className="pa-meta">
-                {formatDate(change.createdAt, timezone)} · {change.summary.changedObjects ?? 0} 项
-              </div>
-              {change.status === 'applied' && (
-                <div className="pa-meta">撤回截止 {formatDate(change.expiresAt, timezone)}</div>
-              )}
-              <footer>
-                <button
-                  type="button"
-                  disabled={busyKey !== ''}
-                  onClick={() => setDetailId(change.id)}
-                >
-                  查看
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    busyKey !== '' ||
-                    change.status !== 'applied' ||
-                    Date.now() >= change.expiresAt
-                  }
-                  onClick={() => void undo(change)}
-                >
-                  {busyKey === `undo:${change.id}` ? '处理中…' : '撤回'}
-                </button>
-                {change.status.startsWith('undone') && (
-                  <button
-                    type="button"
-                    disabled={busyKey !== ''}
-                    onClick={() => void redo(change)}
-                  >
-                    {busyKey === `redo:${change.id}` ? '处理中…' : '重做'}
-                  </button>
-                )}
-                {change.status.startsWith('undone') &&
-                  (change.summary.pairs ?? []).length > 0 && (
-                    <button
-                      type="button"
-                      disabled={busyKey !== ''}
-                      onClick={() => void allowMerge(change)}
-                    >
-                      允许再次归并
-                    </button>
-                  )}
-              </footer>
-            </article>
-          ))}
+          <button type="button" className="pa-primary" disabled={generating} onClick={() => void generate()}>
+            {generating ? '生成中…' : '现在生成'}
+          </button>
         </div>
-      )}
-      {view === 'notifications' && (
-        <div className="pa-notifications">
-          {rows.length === 0 && <EmptyState text="暂无通知" compact />}
-          {groups.map((group) => (
-            <section className="pa-notification-group" key={group.title}>
-              <h3>{group.title}</h3>
-              {group.items.map((notification) => {
-                const payload = notification.payload;
-                return (
-                  <div className="pa-notification" key={notification.id}>
-                    <span>{notificationLabel(notification.type)}</span>
-                    <span className="pa-meta">
-                      {formatDate(notification.created_at, timezone)}
-                    </span>
-                    {typeof payload.title === 'string' && (
-                      <strong>{payload.title}</strong>
-                    )}
-                    {notification.type === 'maintenance.completed' && (
-                      <span>
-                        {payload.processed !== undefined
-                          ? `${String(payload.processed)} 来源 · `
-                          : ''}
-                        {String(
-                          payload.changes ??
-                            (payload.summary as { changedObjects?: number } | undefined)
-                              ?.changedObjects ??
-                            payload.changedObjects ??
-                            0,
-                        )}{' '}
-                        变更
-                      </span>
-                    )}
-                    {notification.type.startsWith('project.') &&
-                      Number(payload.linkedMemories ?? 0) > 0 && (
-                        <span>{String(payload.linkedMemories)} 条历史经验</span>
-                      )}
-                    {notification.type.startsWith('project.') &&
-                      typeof payload.changeId === 'string' && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => setDetailId(payload.changeId as string)}
-                          >
-                            查看变更
-                          </button>
-                          <button
-                            type="button"
-                            disabled={
-                              busyKey !== '' ||
-                              notification.changeStatus !== 'applied' ||
-                              Date.now() >= Number(payload.expiresAt ?? 0)
-                            }
-                            onClick={() =>
-                              void undo(
-                                {
-                                  id: payload.changeId as string,
-                                  createdAt: notification.created_at,
-                                  expiresAt: Number(payload.expiresAt ?? 0),
-                                  status: notification.changeStatus ?? '',
-                                  summary: {
-                                    type: 'project',
-                                    changedObjects: Number(payload.linkedMemories ?? 0),
-                                  },
-                                },
-                              )
-                            }
-                          >
-                            撤回
-                          </button>
-                        </>
-                      )}
-                    {typeof payload.sessionId === 'string' && (
-                      <button
-                        type="button"
-                        onClick={() => api('native.open', { sessionId: payload.sessionId })}
-                      >
-                        {notification.type.startsWith('project.') ? '打开对话' : '打开报告'}
-                      </button>
-                    )}
-                    {typeof payload.error === 'string' && (
-                      <span role="alert">{message(payload.error)}</span>
-                    )}
-                    {!notification.read_at && (
-                      <button
-                        type="button"
-                        disabled={busyKey !== ''}
-                        onClick={() => void readOne(notification)}
-                      >
-                        {busyKey === `read:${notification.id}` ? '处理中…' : '已读'}
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </section>
-          ))}
-        </div>
-      )}
-      {detailId && (
-        <ChangeDetailsDialog
-          api={api}
-          changeId={detailId}
-          onClose={() => setDetailId(null)}
+      </div>
+      {error && <p className="pa-error-inline" role="alert">{error}</p>}
+      {loading ? (
+        <SkeletonCards />
+      ) : rows.length === 0 ? (
+        <EmptyState
+          text="还没有日报。每天 07:00 会自动生成一份；也可以现在生成。"
+          actionLabel="现在生成"
+          onAction={() => void generate()}
         />
+      ) : wide ? (
+        <div className="pa-split">
+          <div className="pa-split-list">
+            {cards}
+            <Pager offset={offset} total={total} onPage={(next) => setOffset(next)} />
+          </div>
+          {selected ? (
+            <section className="pa-split-detail pa-report-detail" aria-label="日报详情">
+              <header className="pa-split-head">
+                <div>
+                  <h2>
+                    {reportDay(selected.windowFrom, timezone)} – {reportDay(selected.windowTo, timezone)}
+                  </h2>
+                  <p className="pa-meta">{reportCountsText(selected)}</p>
+                </div>
+                <button type="button" aria-label="关闭详情" onClick={() => setSelectedId(null)}>
+                  ×
+                </button>
+              </header>
+              {renderDetail(selected)}
+            </section>
+          ) : (
+            <div className="pa-split-empty">从左侧选择一份日报，在这里查看详情。</div>
+          )}
+        </div>
+      ) : (
+        <>
+          <div className="pa-records pa-records-report">{cards}</div>
+          <Pager offset={offset} total={total} onPage={(next) => setOffset(next)} />
+          {selected && (
+            <Modal title="日报详情" onClose={() => setSelectedId(null)} wide>
+              {renderDetail(selected)}
+            </Modal>
+          )}
+        </>
       )}
-    </>
+    </div>
   );
 }
 
 /* ------------------------------------------------------------------ */
 /* Today                                                               */
 /* ------------------------------------------------------------------ */
+
+function activityText(change: ChangeRecord): string {
+  const count = change.summary?.changedObjects;
+  const label = change.summary?.type === 'change' ? '变更' : '整理';
+  const base = typeof count === 'number' && count > 0 ? `${label}了 ${count} 项` : `${label}已完成`;
+  return change.status.startsWith('und') ? `${base}（已撤回）` : base;
+}
 
 interface TodayProps {
   api: Api;
@@ -5152,7 +5062,7 @@ function Today({ api, timezone, onChanged, onNavigate, createSignal }: TodayProp
   const [quickBusy, setQuickBusy] = useState(false);
   const [tasks, setTasks] = useState<Row[]>([]);
   const [events, setEvents] = useState<Row[]>([]);
-  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [activity, setActivity] = useState<ChangeRecord[]>([]);
   const [memories, setMemories] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -5163,15 +5073,20 @@ function Today({ api, timezone, onChanged, onNavigate, createSignal }: TodayProp
   const load = useCallback(async () => {
     try {
       const bounds = dayBounds(timezone);
-      const [taskList, eventList, inboxRows, memoryList] = await Promise.all([
+      const [taskList, eventList, changes, memoryList] = await Promise.all([
         command<ListResult>(api, 'list', { kind: 'task', limit: 100 }),
         command<Row[]>(api, 'calendar', { from: bounds.start, to: bounds.end }),
-        command<Notification[]>(api, 'inbox'),
+        command<ChangeRecord[]>(api, 'changes', { offset: 0 }),
         command<ListResult>(api, 'list', { kind: 'memory', limit: 5, sort: 'updated' }),
       ]);
+      const today = dayKeyOf(Date.now(), timezone);
       setTasks(taskList.items);
       setEvents(eventList);
-      setNotifications(inboxRows);
+      setActivity(
+        (changes ?? [])
+          .filter((change) => dayKeyOf(change.createdAt, timezone) === today)
+          .slice(0, 5),
+      );
       setMemories(
         [...memoryList.items].sort((left, right) => updatedTime(right) - updatedTime(left)),
       );
@@ -5204,8 +5119,6 @@ function Today({ api, timezone, onChanged, onNavigate, createSignal }: TodayProp
     const ms = Date.parse(due);
     return Number.isFinite(ms) && ms < Date.parse(bounds.end);
   });
-  const unread = notifications.filter((row) => !row.read_at);
-
   const saveQuick = async (event: FormEvent) => {
     event.preventDefault();
     const body = quick.trim();
@@ -5259,26 +5172,6 @@ function Today({ api, timezone, onChanged, onNavigate, createSignal }: TodayProp
     }
   };
 
-  const readAll = async () => {
-    if (unread.length === 0) return;
-    setBusyKey('read-all');
-    setError('');
-    try {
-      for (const row of unread) {
-        await command(api, 'inboxRead', { id: row.id });
-      }
-      notify('已全部已读');
-      await load();
-      onChanged();
-    } catch (errorValue) {
-      const mapped = message(errorValue);
-      setError(mapped);
-      notify(mapped, { tone: 'error' });
-    } finally {
-      setBusyKey('');
-    }
-  };
-
   return (
     <div className="pa-today">
       <div className="pa-page-heading">
@@ -5288,6 +5181,24 @@ function Today({ api, timezone, onChanged, onNavigate, createSignal }: TodayProp
         </div>
       </div>
       {error && <div role="alert" className="pa-error">{error}</div>}
+      <section className="pa-today-activity" aria-label="动态">
+        <header>
+          <h3>动态</h3>
+          <span className="pa-meta">最近 5 条</span>
+        </header>
+        {loading ? (
+          <div className="pa-skeleton-line" />
+        ) : activity.length === 0 ? (
+          <p className="pa-meta">今天暂无动态</p>
+        ) : (
+          activity.map((row) => (
+            <div className="pa-activity-row" key={row.id}>
+              <span className="pa-meta">{formatTime(row.createdAt, timezone)}</span>
+              <span>{activityText(row)}</span>
+            </div>
+          ))
+        )}
+      </section>
       <section className="pa-today-quick">
         <h3>快速记录</h3>
         <form className="pa-quick" onSubmit={(event) => void saveQuick(event)}>
@@ -5381,38 +5292,6 @@ function Today({ api, timezone, onChanged, onNavigate, createSignal }: TodayProp
         </section>
         <section className="pa-today-section">
           <header>
-            <h3>未读通知</h3>
-            <button
-              type="button"
-              className="pa-text-button"
-              disabled={busyKey !== '' || unread.length === 0}
-              onClick={() => void readAll()}
-            >
-              {busyKey === 'read-all' ? '处理中…' : '全部已读'}
-            </button>
-          </header>
-          {loading ? (
-            <div className="pa-skeleton-line" />
-          ) : unread.length === 0 ? (
-            <EmptyState
-              text="没有未读通知"
-              actionLabel="打开收件箱"
-              onAction={() => onNavigate('inbox')}
-              compact
-            />
-          ) : (
-            unread.slice(0, 3).map((row) => (
-              <div className="pa-row" key={row.id}>
-                <div className="pa-row-main">
-                  <span>{typeof row.payload.title === 'string' ? row.payload.title : '更新'}</span>
-                  <div className="pa-meta">{formatDate(row.created_at, timezone)}</div>
-                </div>
-              </div>
-            ))
-          )}
-        </section>
-        <section className="pa-today-section">
-          <header>
             <h3>最近记忆</h3>
             <button type="button" className="pa-text-button" onClick={() => onNavigate('memory')}>
               全部记忆
@@ -5453,18 +5332,9 @@ function Today({ api, timezone, onChanged, onNavigate, createSignal }: TodayProp
 /* Settings                                                            */
 /* ------------------------------------------------------------------ */
 
-type NumericSetting =
-  | 'retentionHours'
-  | 'rawDays'
-  | 'maintenanceHour'
-  | 'maintenanceMaxItems'
-  | 'maintenanceMaxSeconds'
-  | 'contextCharacters'
-  | 'rollbackMegabytes';
-
 const SETTINGS_SECTIONS: Array<{ id: string; label: string }> = [
   { id: 'workspace', label: '助手工作区' },
-  { id: 'memory', label: '记忆与维护' },
+  { id: 'report', label: '报告' },
   { id: 'data', label: '数据与迁移' },
   { id: 'appearance', label: '外观与引导' },
   { id: 'weixin', label: '微信' },
@@ -5511,7 +5381,14 @@ function Settings({
       api<SettingsOptions>('settings.options'),
       api<WeixinState>('weixin.status'),
     ]);
-    setSettings(nextSettings);
+    setSettings({
+      ...nextSettings,
+      reportEnabled: nextSettings.reportEnabled ?? REPORT_SETTING_DEFAULTS.reportEnabled,
+      reportHour: nextSettings.reportHour ?? REPORT_SETTING_DEFAULTS.reportHour,
+      snapshotDays: nextSettings.snapshotDays ?? REPORT_SETTING_DEFAULTS.snapshotDays,
+      changeSummaryDays:
+        nextSettings.changeSummaryDays ?? REPORT_SETTING_DEFAULTS.changeSummaryDays,
+    });
     setVault(nextVault);
     setOptions(nextOptions);
     setDestination(nextOptions.defaults.exportDirectory);
@@ -5582,14 +5459,23 @@ function Settings({
     return <EmptyState text={error || '加载中…'} />;
   }
 
-  const numberField = (key: NumericSetting, label: string) => (
+  const reportNumberField = (
+    key: 'snapshotDays' | 'changeSummaryDays',
+    label: string,
+    min: number,
+    max: number,
+  ) => (
     <Field label={label}>
       <input
         type="number"
+        min={min}
+        max={max}
         value={settings[key]}
-        onChange={(event) =>
-          setSettings({ ...settings, [key]: Number(event.target.value) })
-        }
+        onChange={(event) => {
+          const raw = Number(event.target.value);
+          const next = Number.isFinite(raw) ? Math.min(max, Math.max(min, Math.trunc(raw))) : min;
+          setSettings({ ...settings, [key]: next });
+        }}
       />
     </Field>
   );
@@ -5731,20 +5617,20 @@ function Settings({
             {saveButton}
           </section>
         )}
-        {section === 'memory' && (
+        {section === 'report' && (
           <section className="pa-settings-card">
             <header>
-              <h3>记忆与维护</h3>
+              <h3>报告</h3>
               <label className="pa-switch">
                 <input
-                  aria-label="自动维护"
+                  aria-label="每日报告"
                   type="checkbox"
-                  checked={settings.maintenanceEnabled}
+                  checked={settings.reportEnabled}
                   onChange={(event) =>
-                    setSettings({ ...settings, maintenanceEnabled: event.target.checked })
+                    setSettings({ ...settings, reportEnabled: event.target.checked })
                   }
                 />
-                <span>自动维护</span>
+                <span>每日报告</span>
               </label>
             </header>
             <div className="pa-settings-fields">
@@ -5759,11 +5645,11 @@ function Settings({
                     ))}
                   </select>
                 </Field>
-                <Field label="每日整理时间">
+                <Field label="生成时间">
                   <select
-                    value={settings.maintenanceHour}
+                    value={settings.reportHour ?? 7}
                     onChange={(event) =>
-                      setSettings({ ...settings, maintenanceHour: Number(event.target.value) })
+                      setSettings({ ...settings, reportHour: Number(event.target.value) })
                     }
                   >
                     {Array.from({ length: 24 }, (_, hour) => (
@@ -5773,18 +5659,12 @@ function Settings({
                     ))}
                   </select>
                 </Field>
-                {numberField('rawDays', '普通原文保留天数')}
-                {numberField('retentionHours', '撤回小时数')}
+                {reportNumberField('snapshotDays', '快照保留天数', 1, 90)}
+                {reportNumberField('changeSummaryDays', '变更摘要保留天数', 1, 365)}
               </div>
-              <details className="pa-advanced">
-                <summary>高级设置</summary>
-                <div className="pa-grid2">
-                  {numberField('maintenanceMaxItems', '每批最多条目')}
-                  {numberField('maintenanceMaxSeconds', '每轮最多秒数')}
-                  {numberField('contextCharacters', '召回字符预算')}
-                  {numberField('rollbackMegabytes', '恢复资料空间（MB）')}
-                </div>
-              </details>
+              <p className="pa-hint">
+                报告每天 07:00 生成并推送到微信；可在日报会话里直接提出修改。
+              </p>
             </div>
             {saveButton}
           </section>
@@ -6057,7 +5937,7 @@ const BOTTOM_TABS: Array<{ id: TabId; label: string; icon: string }> = [
 const MORE_TABS: Array<{ id: TabId; label: string; icon: string }> = [
   { id: 'project', label: '项目', icon: '▤' },
   { id: 'tool', label: '工具', icon: '⚒' },
-  { id: 'inbox', label: '收件箱', icon: '✉' },
+  { id: 'report', label: '日报', icon: '≡' },
   { id: 'settings', label: '设置', icon: '⚙' },
 ];
 
@@ -6084,6 +5964,10 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
       model: '',
       basePreset: '',
       workspace: '',
+      reportEnabled: REPORT_SETTING_DEFAULTS.reportEnabled,
+      reportHour: REPORT_SETTING_DEFAULTS.reportHour,
+      snapshotDays: REPORT_SETTING_DEFAULTS.snapshotDays,
+      changeSummaryDays: REPORT_SETTING_DEFAULTS.changeSummaryDays,
     },
   });
   const [error, setError] = useState('');
@@ -6190,7 +6074,7 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
   const maintain = async () => {
     try {
       await api('maintenance.run', { requestId: crypto.randomUUID() });
-      notify('已开始整理，稍后可到收件箱查看结果');
+      notify('已开始整理，完成后可在动态里查看');
       refresh();
     } catch (errorValue) {
       notify(message(errorValue), { tone: 'error' });
@@ -6326,9 +6210,6 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
             onClick={() => setTab(item.id)}
           >
             {item.label}
-            {item.id === 'inbox' && overview.unread > 0 && (
-              <span className="pa-badge">{overview.unread}</span>
-            )}
           </button>
         ))}
       </nav>
@@ -6363,8 +6244,8 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
               onOpenConsumed={() => setEventRequest(null)}
             />
           )}
-          {tab === 'inbox' && (
-            <Inbox api={api} timezone={timezone} onChange={refresh} />
+          {tab === 'report' && (
+            <ReportPage api={api} timezone={timezone} wide={wide} />
           )}
           {tab === 'settings' && (
             <Settings
@@ -6397,13 +6278,12 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
         ))}
         <button
           type="button"
-          className={cx(['project', 'tool', 'inbox', 'settings'].includes(tab) && 'pa-selected')}
+          className={cx(['project', 'tool', 'report', 'settings'].includes(tab) && 'pa-selected')}
           aria-expanded={moreOpen}
           onClick={() => setMoreOpen((value) => !value)}
         >
           <span aria-hidden="true">⋯</span>
           更多
-          {overview.unread > 0 && <span className="pa-badge">{overview.unread}</span>}
         </button>
       </nav>
       {moreOpen && (
@@ -6433,9 +6313,6 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
                   }}
                 >
                   <span aria-hidden="true">{item.icon}</span> {item.label}
-                  {item.id === 'inbox' && overview.unread > 0 && (
-                    <span className="pa-badge">{overview.unread}</span>
-                  )}
                 </button>
               ))}
             </nav>

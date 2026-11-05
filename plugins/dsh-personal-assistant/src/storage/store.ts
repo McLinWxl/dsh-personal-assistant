@@ -1,6 +1,6 @@
 import { randomUUID,createHash } from 'node:crypto';
-import { writeFileSync,readFileSync,mkdirSync,existsSync,renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { writeFileSync,readFileSync,mkdirSync,existsSync,renameSync,statSync,unlinkSync } from 'node:fs';
+import { join,resolve,relative,isAbsolute } from 'node:path';
 import { MemoryStore,digest,tokens } from './memory-base.mjs';
 import { openDirectory,inside,atomicJson } from './files.js';
 import { defaults,settingsSchema,validate,formattedDeadline,type Actor,type Settings } from '../domain/contracts.js';
@@ -9,6 +9,7 @@ import {Projects} from './projects.js';
 const Base:any=MemoryStore;
 const fail=(code:string):never=>{throw new Error(code);};
 const clone=<T>(v:T):T=>structuredClone(v);
+const json=(value:any,fallback:any=null)=>{try{return value==null?fallback:JSON.parse(value);}catch{return fallback;}};
 
 export class Store extends Base {
   directory:ReturnType<typeof openDirectory>;
@@ -31,6 +32,13 @@ export class Store extends Base {
       CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY,session_id TEXT UNIQUE,title TEXT NOT NULL,updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS chat_requests(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,session_id TEXT NOT NULL,created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS channel_messages(id TEXT PRIMARY KEY,direction TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,window_from INTEGER NOT NULL,window_to INTEGER NOT NULL,status TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,conversation_id TEXT,session_id TEXT,message_id TEXT,snapshot_id TEXT,body TEXT NOT NULL DEFAULT '',summary_json TEXT NOT NULL DEFAULT '{}',created_at INTEGER NOT NULL,confirmed_at INTEGER,pushed_at INTEGER);
+      CREATE INDEX IF NOT EXISTS report_created ON reports(created_at);
+      CREATE TABLE IF NOT EXISTS report_items(id TEXT PRIMARY KEY,report_id TEXT NOT NULL,kind TEXT NOT NULL,object_id TEXT,action TEXT NOT NULL,title TEXT NOT NULL DEFAULT '',detail TEXT NOT NULL DEFAULT '',at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS report_item_report ON report_items(report_id,at);
+      CREATE TABLE IF NOT EXISTS report_revisions(id TEXT PRIMARY KEY,report_id TEXT NOT NULL,revision INTEGER NOT NULL,body TEXT NOT NULL,created_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS report_revision_report ON report_revisions(report_id,revision);
+      CREATE TABLE IF NOT EXISTS snapshots(id TEXT PRIMARY KEY,taken_at INTEGER NOT NULL,path TEXT NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,expires_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS node_kind ON nodes(kind);
       PRAGMA user_version=1;
     `);
@@ -67,12 +75,14 @@ export class Store extends Base {
     this.db.prepare('INSERT INTO sources VALUES(?,?,?,?,?,?,?)').run(input.id,input.sessionId,input.role,input.text,input.at??this.now(),input.status??'pending',input.projectId??null);if(input.context)this.db.prepare('INSERT OR IGNORE INTO source_context VALUES(?,?,?,?)').run(input.id,input.context.workspace,input.context.preset,input.context.origin);this.projects.enqueue(input);return{id:input.id};
   }
   dispatch(command:string,input:unknown,key:string,actor:Actor){
-    const a:any=validate(command,input);const reads=new Set(['overview','list','get','settingsGet','memorySearch','related','relations','calendar','icsExport','changes','change','inbox','toolVersions']);
-    const result=reads.has(command)?this.execute(command,a,key,actor):this.command(key,{command,a,actor:actor.kind},()=>this.execute(command,a,key+':body',actor));
+    const a:any=validate(command,input);const reads=new Set(['overview','list','get','settingsGet','memorySearch','related','relations','calendar','icsExport','changes','change','inbox','toolVersions','reportWindow','reportList','reportGet']);
+    // VACUUM INTO cannot run inside a transaction, so snapshots bypass the command wrapper.
+    const direct=reads.has(command)||command==='snapshotTake';
+    const result=direct?this.execute(command,a,key,actor):this.command(key,{command,a,actor:actor.kind},()=>this.execute(command,a,key+':body',actor));
     if(command==='settingsSave'){this.settings=settingsSchema.parse(JSON.parse(this.db.prepare("SELECT value FROM settings WHERE key='preferences'").get().value));this.retentionMs=this.settings.retentionHours*3600000;}return result;
   }
   execute(command:string,a:any,key:string,actor:Actor){
-    const uiOnly=['settingsSave','remove','toolActivate','inboxRead','allowMerge'];
+    const uiOnly=['settingsSave','remove','toolActivate','inboxRead'];
     if(uiOnly.includes(command)&&actor.kind!=='ui'&&actor.kind!=='system')fail('OWNER_ACTION_REQUIRED');
     switch(command){
       case'overview':return{counts:Object.fromEntries(this.db.prepare('SELECT kind,COUNT(*) AS n FROM nodes GROUP BY kind').all().map((r:any)=>[r.kind,r.n])),unread:Number(this.db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get().n),dataRoot:this.directory.root,settings:this.settings};
@@ -101,17 +111,42 @@ export class Store extends Base {
       case'consolidate':return this.command(key,{command,a},()=>{const result=this.commitPlan(this.planSemanticConsolidation(a.groups));if(result.changeId)this.notify('maintenance.completed',result,result.changeId);return result;});
       case'maintain':return this.command(key,{command},()=>{const result=this.commitPlan(this.planConsolidation());if(result.changeId)this.notify('maintenance.completed',result,result.changeId);return result;});
       case'changes':return this.db.prepare('SELECT id FROM changes ORDER BY created_at DESC,id LIMIT 40 OFFSET ?').all(a.offset).map((r:any)=>this.change(r.id));
-      case'change':{const c=this.change(a.id);const live=this.now()<c.expiresAt?this.rollbackItems(a.id):[];const parse=(value:any)=>value?JSON.parse(value):null;
-        const items=live.map((d:any)=>{const before=parse(d.before_json),after=parse(d.after_json);const fields:any[]=[];
-          if(before?.data&&after?.data)for(const name of new Set([...Object.keys(before.data),...Object.keys(after.data)]))if(JSON.stringify(before.data[name])!==JSON.stringify(after.data[name]))fields.push({name,before:before.data[name],after:after.data[name]});
-          return{id:d.object_id,before,after,fields};});
-        const deltas=live.map((d:any)=>({tableName:d.table_name,objectId:d.object_id,before:parse(d.before_json),after:parse(d.after_json)}));
-        return{...c,expiresDisplay:formattedDeadline(c.expiresAt,this.settings.timezone),items,deltas};}
-      case'undo':return this.command(key,{command,a},()=>{const result=super.undo(a.id,key+':undo');this.projects.undo(a.id);this.notify('maintenance.undone',result,'undo:'+a.id);return result;});
-      case'redo':return this.command(key,{command,a},()=>{const result=super.redo(a.id,key+':redo');this.notify('maintenance.redone',result,'redo:'+a.id);return result;});
+      case'change':{const c=this.change(a.id);const summary:any=c.summary??{};
+        const items=Array.isArray(summary.items)?summary.items.map((item:any)=>({kind:String(item?.kind??'maintenance'),objectId:String(item?.objectId??item?.object_id??''),title:String(item?.title??''),action:String(item?.action??'updated'),detail:String(item?.detail??'').slice(0,200)}))
+          :this.db.prepare('SELECT table_name,object_id,before_json,after_json FROM deltas WHERE change_id=? ORDER BY position').all(a.id).map((d:any)=>{
+            const before=d.before_json==null?null:json(this.codec.open(d.before_json)),after=d.after_json==null?null:json(this.codec.open(d.after_json));
+            const row=this.get(d.table_name,d.object_id),kind=String(row?.kind??(d.table_name==='edges'?'edge':'object'));
+            const title=String(row?.data?.title??row?.data?.name??d.object_id);
+            return{kind,objectId:String(d.object_id),title,action:before==null?'created':after==null?'removed':'updated',detail:String(summary.type??'')};});
+        return{id:c.id,createdAt:c.createdAt,expiresAt:c.expiresAt,status:c.status,summary,items,expiresDisplay:formattedDeadline(c.expiresAt,this.settings.timezone)};}
+      case'reportWindow':return this.reportWindow(a);
+      case'reportSave':{const now=this.now(),id=randomUUID();
+        this.db.prepare("UPDATE reports SET status='superseded' WHERE status='draft'").run();
+        this.db.prepare('INSERT INTO reports(id,window_from,window_to,status,revision,conversation_id,session_id,message_id,snapshot_id,body,summary_json,created_at,confirmed_at,pushed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)').run(id,a.from,a.to,'draft',1,a.conversationId??null,a.sessionId??null,a.messageId??null,a.snapshotId??null,String(a.body??''),JSON.stringify(a.summary??{}),now);
+        for(const item of a.items??[])this.insertReportItem(id,item,now);
+        this.db.prepare('INSERT INTO report_revisions VALUES(?,?,?,?,?)').run(randomUUID(),id,1,String(a.body??''),now);
+        return{id,revision:1,status:'draft'};}
+      case'reportRevise':{const row=this.db.prepare('SELECT * FROM reports WHERE id=?').get(a.id);if(!row)fail('REPORT_NOT_FOUND');if(row.status!=='draft')fail('REPORT_NOT_DRAFT');
+        const now=this.now(),revision=Number(row.revision)+1;
+        this.db.prepare('UPDATE reports SET body=?,revision=?,summary_json=? WHERE id=?').run(String(a.body??''),revision,a.summary===undefined?row.summary_json:JSON.stringify(a.summary),a.id);
+        if(a.items!==undefined){this.db.prepare('DELETE FROM report_items WHERE report_id=?').run(a.id);for(const item of a.items)this.insertReportItem(a.id,item,now);}
+        this.db.prepare('INSERT INTO report_revisions VALUES(?,?,?,?,?)').run(randomUUID(),a.id,revision,String(a.body??''),now);
+        return{id:a.id,revision};}
+      case'reportConfirm':{const row=this.db.prepare('SELECT * FROM reports WHERE id=?').get(a.id);if(!row)fail('REPORT_NOT_FOUND');
+        this.db.prepare("UPDATE reports SET status='confirmed',confirmed_at=? WHERE id=?").run(this.now(),a.id);
+        const updated=this.db.prepare('SELECT * FROM reports WHERE id=?').get(a.id);
+        return this.reportRow(updated,true,Number(this.db.prepare('SELECT COUNT(*) AS n FROM report_items WHERE report_id=?').get(a.id).n));}
+      case'reportList':{const total=Number(this.db.prepare('SELECT COUNT(*) AS n FROM reports').get().n);
+        const rows=this.db.prepare('SELECT r.*,(SELECT COUNT(*) FROM report_items i WHERE i.report_id=r.id) AS item_count FROM reports r ORDER BY r.created_at DESC,r.id DESC LIMIT ? OFFSET ?').all(a.limit,a.offset);
+        return{items:rows.map((r:any)=>this.reportRow(r,false,r.item_count)),total,offset:a.offset};}
+      case'reportGet':{const row=this.db.prepare('SELECT * FROM reports WHERE id=?').get(a.id);if(!row)fail('REPORT_NOT_FOUND');
+        const items=this.db.prepare('SELECT * FROM report_items WHERE report_id=? ORDER BY at,id').all(a.id).map((i:any)=>({id:i.id,kind:i.kind,objectId:i.object_id,action:i.action,title:i.title,detail:i.detail,at:Number(i.at)}));
+        const revisions=this.db.prepare('SELECT revision,body,created_at FROM report_revisions WHERE report_id=? ORDER BY revision').all(a.id).map((r:any)=>({revision:Number(r.revision),body:r.body,createdAt:Number(r.created_at)}));
+        return{...this.reportRow(row,true,items.length),items,revisions};}
+      case'snapshotTake':return this.snapshotTake();
+      case'snapshotPrune':return this.snapshotPrune(a.days);
       case'remove':return this.remove(a.id,a.revision,key);
       case'memoryRemove':if(actor.kind==='maintenance')fail('MAINTENANCE_COMMAND_NOT_ALLOWED');this.node(a.id,'memory');return this.remove(a.id,a.revision,key);
-      case'allowMerge':{const change=this.change(a.id);if(!change.status.startsWith('undone'))fail('UNDO_REQUIRED');for(const pair of change.summary.pairs??[])this.db.prepare('DELETE FROM merge_blocks WHERE pair_hash=?').run(pair);return{allowed:true};}
       case'taskCreate':this.taskReferences(a);return this.create('task',this.taskData(a),key);
       case'taskEdit':{const row=this.node(a.id,'task');this.taskReferences({...row.data,...a.patch},a.id);if(actor.kind==='model'&&a.patch.status==='completed')fail('TASK_COMPLETION_REQUIRES_RUN_RESULT');return this.edit(a.id,'task',this.taskData({...row.data,...a.patch}),a.revision,key);}
       case'eventCreate':this.eventReferences(a);validateEvent(a);return this.create('event',a,key);
@@ -130,6 +165,81 @@ export class Store extends Base {
       case'link':return this.link(a.from,a.to,a.kind,key);
       default:return fail('UNKNOWN_COMMAND');
     }
+  }
+  reportWindow(a:any){
+    const to=this.now();
+    let from:number;
+    if(a.from!==undefined)from=Number(a.from);
+    else{const last:any=this.db.prepare("SELECT COALESCE(confirmed_at,window_to) AS anchor FROM reports ORDER BY created_at DESC,id DESC LIMIT 1").get();from=last?Number(last.anchor):to-86400000;}
+    const items:any[]=[];
+    const number=(value:any)=>{const n=Number(value);return Number.isFinite(n)?n:null;};
+    const nodeRows=this.db.prepare("SELECT id FROM nodes WHERE kind IN ('memory','project','task','event','tool') AND (COALESCE(json_extract(data,'$.createdAt'),-1)>=? AND COALESCE(json_extract(data,'$.createdAt'),-1)<? OR COALESCE(json_extract(data,'$.updatedAt'),-1)>=? AND COALESCE(json_extract(data,'$.updatedAt'),-1)<?)").all(from,to,from,to);
+    for(const entry of nodeRows){
+      const data=this.node(entry.id).data,created=number(data.createdAt),updated=number(data.updatedAt);
+      const createdIn=created!==null&&created>=from&&created<to,updatedIn=updated!==null&&updated>=from&&updated<to;
+      if(!createdIn&&!updatedIn)continue;
+      items.push({kind:this.get('nodes',entry.id).kind,objectId:entry.id,action:createdIn?'created':'updated',title:String(data.title??''),detail:String(data.body??data.goal??data.description??'').slice(0,160),at:createdIn?created:updated});
+    }
+    for(const row of this.db.prepare('SELECT * FROM changes WHERE created_at>=? AND created_at<?').all(from,to)){
+      const summary:any=json(row.summary)??{},type=String(summary.type??''),changed=Number(summary.changedObjects??this.db.prepare('SELECT COUNT(*) AS n FROM deltas WHERE change_id=?').get(row.id).n);
+      items.push({kind:'maintenance',objectId:row.id,action:/merge|consolidat|maintain/.test(type)||summary.groups?'merged':'updated',title:String(summary.title??(summary.groups?'记忆归并':type||'整理记录')),detail:`影响 ${changed} 项`,at:Number(row.created_at)});
+    }
+    for(const row of this.db.prepare('SELECT * FROM runs WHERE (created_at>=? AND created_at<?) OR (updated_at>=? AND updated_at<?)').all(from,to,from,to)){
+      const created=number(row.created_at),updated=number(row.updated_at),at=updated!==null&&updated>=from&&updated<to?updated:created;
+      let title=String(row.task_id??row.id);
+      if(row.task_id){const task=this.get('nodes',row.task_id);if(task)title=String(task.data.title??title);}
+      if(row.workflow_version){const version=this.db.prepare('SELECT definition FROM tool_versions WHERE id=?').get(row.workflow_version);if(version){const definition:any=json(version.definition)??{};if(definition.title)title=String(definition.title);}}
+      items.push({kind:'run',objectId:row.id,action:row.status==='failed'?'failed':'ran',title,detail:String(row.status??''),at:Number(at)});
+    }
+    const notices=this.db.prepare("SELECT * FROM notifications WHERE created_at>=? AND created_at<? AND (type LIKE 'maintenance.%' OR type LIKE 'weixin.%' OR type IN ('task.failed','task.unknown'))").all(from,to);
+    for(const row of notices){
+      const type=String(row.type??''),payload:any=json(row.payload)??{};
+      const kind=type.startsWith('weixin.')?'wechat':type.startsWith('task.')?'run':'maintenance';
+      const labels:any={'maintenance.completed':'整理完成','maintenance.failed':'整理失败','weixin.delivery-unknown':'微信消息状态未知','task.failed':'任务执行失败','task.unknown':'任务结果未知'};
+      const detail=String(payload.error??payload.messageId??payload.runId??(type==='maintenance.completed'?`影响 ${payload.changedObjects??0} 项`:type));
+      items.push({kind,objectId:row.id,action:/failed|unknown|error/.test(type)?'failed':'confirmed',title:String(payload.title??labels[type]??type),detail:detail.slice(0,160),at:Number(row.created_at)});
+    }
+    items.sort((x:any,y:any)=>x.at-y.at||String(x.objectId).localeCompare(String(y.objectId)));
+    const capped=items.length>400?items.slice(-400):items;
+    const summary:any={memories:0,projects:0,tasks:0,events:0,tools:0,runs:0,wechat:0,maintenance:0};
+    const buckets:Record<string,string>={memory:'memories',project:'projects',task:'tasks',event:'events',tool:'tools',run:'runs',wechat:'wechat',maintenance:'maintenance'};
+    for(const item of capped){const key=buckets[item.kind];if(key)summary[key]++;}
+    return{from,to,summary,items:capped};
+  }
+  reportRow(row:any,full=false,counts=0){
+    return{id:row.id,windowFrom:Number(row.window_from),windowTo:Number(row.window_to),status:String(row.status),revision:Number(row.revision),conversationId:row.conversation_id??null,sessionId:row.session_id??null,messageId:row.message_id??null,snapshotId:row.snapshot_id??null,body:full?String(row.body??''):String(row.body??'').slice(0,4000),summary:json(row.summary_json)??{},createdAt:Number(row.created_at),confirmedAt:row.confirmed_at??null,pushedAt:row.pushed_at??null,counts:Number(counts)};
+  }
+  insertReportItem(reportId:string,item:any,fallbackAt:number){
+    const at=Number(item?.at),ts=Number.isFinite(at)?Math.trunc(at):fallbackAt;
+    this.db.prepare('INSERT INTO report_items VALUES(?,?,?,?,?,?,?,?)').run(randomUUID(),reportId,String(item?.kind??'maintenance'),item?.objectId??item?.object_id??null,String(item?.action??'updated'),String(item?.title??''),String(item?.detail??'').slice(0,1000),ts);
+  }
+  snapshotTake(){
+    const now=this.now(),directory=join(this.directory.root,'snapshots'),stamp=this.snapshotStamp(now);
+    mkdirSync(directory,{recursive:true});
+    let path=join(directory,stamp+'.sqlite'),suffix=1;
+    while(existsSync(path))path=join(directory,stamp+'-'+(++suffix)+'.sqlite');
+    this.db.exec(`VACUUM INTO '${path.replaceAll("'","''")}'`);
+    const bytes=statSync(path).size,sha256=createHash('sha256').update(readFileSync(path)).digest('hex'),id=randomUUID();
+    this.db.prepare('INSERT INTO snapshots VALUES(?,?,?,?,?,?)').run(id,now,path,bytes,sha256,now+this.settings.snapshotDays*86400000);
+    return{id,path,bytes,sha256};
+  }
+  snapshotStamp(ms:number){
+    const parts=new Intl.DateTimeFormat('en-CA',{timeZone:this.settings.timezone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).formatToParts(new Date(ms));
+    const get=(type:string)=>parts.find(part=>part.type===type)?.value??'00';
+    return `${get('year')}-${get('month')}-${get('day')}-${get('hour')}${get('minute')}${get('second')}`;
+  }
+  snapshotDayKey(ms:number){return this.snapshotStamp(ms).slice(0,10);}
+  snapshotPrune(days?:number){
+    const now=this.now(),cutoff=now-(days??this.settings.snapshotDays)*86400000,kept=new Set<string>(),remove:any[]=[];
+    for(const row of this.db.prepare('SELECT * FROM snapshots ORDER BY taken_at DESC').all()){
+      if(Number(row.expires_at)<=now){remove.push(row);continue;}
+      if(Number(row.taken_at)<cutoff){const day=this.snapshotDayKey(Number(row.taken_at));if(kept.has(day))remove.push(row);else kept.add(day);}
+    }
+    for(const row of remove){
+      this.db.prepare('DELETE FROM snapshots WHERE id=?').run(row.id);
+      try{const path=resolve(String(row.path)),local=relative(this.directory.root,path);if(local&&!local.startsWith('..')&&!isAbsolute(local))unlinkSync(path);}catch{}
+    }
+    return{removed:remove.length};
   }
   list(a:any){
     let sql='SELECT id FROM nodes WHERE kind=?';const params:any[]=[a.kind];
@@ -217,8 +327,12 @@ export class Store extends Base {
   associateSelected(projectId:string,versions:any[],key:string){return this.command(key,{action:'associate',projectId,versions},()=>{const candidates=new Set(this.findRelated(projectId).map((r:any)=>r.id));const mutations:any[]=[];for(const {id,revision}of versions){if(!candidates.has(id))fail('INAPPLICABLE_MEMORY');if(this.node(id).revision!==revision)fail('STALE_VERSION');if(!this.all('edges').some((e:any)=>e.data.from===projectId&&e.data.to===id&&e.data.kind==='reuses_method'))mutations.push({id:randomUUID(),table:'edges',kind:'edge',data:{from:projectId,to:id,kind:'reuses_method'}});}return{projectId,memoryIds:versions.map(r=>r.id),createdLinks:mutations.length,...mutations.length?this.journal('relation.created',mutations):{}};});}
   commitPlan(plan:any){const result=super.commitPlan(plan);const bytes=Number(this.db.prepare('SELECT COALESCE(SUM(LENGTH(before_json)+COALESCE(LENGTH(after_json),0)),0) AS n FROM deltas').get().n);if(bytes>this.settings.rollbackMegabytes*1024*1024)fail('ROLLBACK_STORAGE_FULL');return{...result,...result.expiresAt?{expiresDisplay:formattedDeadline(result.expiresAt,this.settings.timezone)}:{}};}
   pendingSources(limit=40){return this.db.prepare("SELECT s.id,s.session_id,s.role,s.text,s.at,s.project_id,c.workspace,c.preset FROM sources s LEFT JOIN source_context c ON c.id=s.id WHERE status='pending' ORDER BY at LIMIT ?").all(limit);}
-  purge(){super.purgeExpired();const cutoff=this.now()-this.settings.rawDays*86400000;const removed=this.db.prepare("DELETE FROM sources WHERE at<? AND status IN ('captured','ordinary','temporary') AND id NOT IN (SELECT source_id FROM project_resolutions WHERE status='pending') AND (project_id IS NULL OR project_id NOT IN (SELECT id FROM nodes WHERE kind='project' AND json_extract(data,'$.status')='active'))").run(cutoff).changes;this.db.prepare("DELETE FROM channel_messages WHERE created_at<? AND status IN ('done','sent','unknown')").run(cutoff);
-    const versionCutoff=this.now()-this.retentionMs;const versions=this.db.prepare('SELECT id,tool_id,created_at FROM tool_versions ORDER BY tool_id,created_at DESC').all();const retained=new Map<string,number>();let purgedVersions=0;for(const v of versions){const tool=this.get('nodes',v.tool_id);const count=retained.get(v.tool_id)??0;retained.set(v.tool_id,count+1);if(v.created_at>=versionCutoff||tool&&(count<3||tool.data.activeVersion===v.id||tool.data.pendingVersion===v.id))continue;purgedVersions+=Number(this.db.prepare('DELETE FROM tool_versions WHERE id=? AND tool_id=?').run(v.id,v.tool_id).changes);}
-    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');return{purgedSources:removed,purgedVersions};}
+  purge(){super.purgeExpired();const now=this.now(),cutoff=now-this.settings.rawDays*86400000;const removed=this.db.prepare("DELETE FROM sources WHERE at<? AND status IN ('captured','ordinary','temporary') AND id NOT IN (SELECT source_id FROM project_resolutions WHERE status='pending') AND (project_id IS NULL OR project_id NOT IN (SELECT id FROM nodes WHERE kind='project' AND json_extract(data,'$.status')='active'))").run(cutoff).changes;this.db.prepare("DELETE FROM channel_messages WHERE created_at<? AND status IN ('done','sent','unknown')").run(cutoff);
+    const versionCutoff=now-this.retentionMs;const versions=this.db.prepare('SELECT id,tool_id,created_at FROM tool_versions ORDER BY tool_id,created_at DESC').all();const retained=new Map<string,number>();let purgedVersions=0;for(const v of versions){const tool=this.get('nodes',v.tool_id);const count=retained.get(v.tool_id)??0;retained.set(v.tool_id,count+1);if(v.created_at>=versionCutoff||tool&&(count<3||tool.data.activeVersion===v.id||tool.data.pendingVersion===v.id))continue;purgedVersions+=Number(this.db.prepare('DELETE FROM tool_versions WHERE id=? AND tool_id=?').run(v.id,v.tool_id).changes);}
+    const journalCutoff=now-7*86400000;const purgedDeltas=Number(this.db.prepare('DELETE FROM deltas WHERE change_id IN (SELECT id FROM changes WHERE created_at<?)').run(journalCutoff).changes);
+    const changeCutoff=now-this.settings.changeSummaryDays*86400000;const purgedChanges=Number(this.db.prepare('DELETE FROM changes WHERE created_at<?').run(changeCutoff).changes);
+    this.db.prepare('DELETE FROM deltas WHERE change_id NOT IN (SELECT id FROM changes)').run();
+    const purgedSnapshots=this.snapshotPrune().removed;
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');return{purgedSources:removed,purgedVersions,purgedDeltas,purgedChanges,purgedSnapshots};}
   health(){return{integrity:this.db.prepare('PRAGMA integrity_check').get().integrity_check,foreignKeys:this.db.prepare('PRAGMA foreign_key_check').all(),schemaVersion:1,datasetId:this.owner()};}
 }

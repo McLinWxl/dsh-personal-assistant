@@ -21,6 +21,10 @@ export interface AssistantSettings {
  model:string;
  basePreset:string;
  workspace:string;
+ reportEnabled:boolean;
+ reportHour:number;
+ snapshotDays:number;
+ changeSummaryDays:number;
 }
 
 export interface SourceRecord {
@@ -90,14 +94,64 @@ export interface MaintenanceCommand {command:string;payload:any}
 
 export interface MaintenanceResult {results:{changeId?:string}[]}
 
-export interface ChangeItem {before?:{data:any}|null;after?:{data:any}|null}
+export interface ChangeItem {kind:string;objectId:string;title:string;action:string;detail:string}
 
 export interface ChangeDetails {
  id:string;
- summary:{type?:string;changedObjects?:number};
+ createdAt:number;
+ summary:{type?:string;changedObjects?:number;title?:string;items?:ChangeItem[]};
  expiresAt:number;
+ status:string;
  items:ChangeItem[];
+ expiresDisplay:string;
 }
+
+export interface ReportItem {
+ kind:'memory'|'project'|'task'|'event'|'tool'|'run'|'wechat'|'maintenance'|string;
+ objectId:string|null;
+ action:string;
+ title:string;
+ detail:string;
+ at:number;
+}
+
+export interface ReportSummary {
+ memories:number;
+ projects:number;
+ tasks:number;
+ events:number;
+ tools:number;
+ runs:number;
+ wechat:number;
+ maintenance:number;
+}
+
+export interface ReportWindowResult {from:number;to:number;summary:ReportSummary;items:ReportItem[]}
+
+export interface ReportRow {
+ id:string;
+ windowFrom:number;
+ windowTo:number;
+ status:string;
+ revision:number;
+ conversationId:string|null;
+ sessionId:string|null;
+ messageId:string|null;
+ snapshotId:string|null;
+ body:string;
+ summary:ReportSummary|Record<string,unknown>;
+ createdAt:number;
+ confirmedAt:number|null;
+ pushedAt:number|null;
+ counts:number;
+}
+
+export interface ReportDetail extends ReportRow {
+ items:ReportItem[];
+ revisions:{revision:number;body:string;createdAt:number}[];
+}
+
+export interface SnapshotRecord {id:string;path:string;bytes:number;sha256:string}
 
 export interface HealthReport {integrity:string}
 
@@ -139,6 +193,14 @@ export interface StorageMethods {
  maintenanceProgress:{args:{offset:number};result:unknown};
  maintenanceDone:{args:{stamp:unknown};result:unknown};
  change:{args:{id:string};result:ChangeDetails};
+ reportWindow:{args:{from?:number};result:ReportWindowResult};
+ reportSave:{args:{from:number;to:number;summary:any;items:ReportItem[];conversationId?:string;sessionId?:string;messageId?:string;snapshotId?:string;body:string};result:{id:string;revision:number;status:string}};
+ reportRevise:{args:{id:string;body:string;summary?:any;items?:ReportItem[]};result:{id:string;revision:number}};
+ reportConfirm:{args:{id:string};result:ReportRow};
+ reportList:{args:{offset?:number;limit?:number};result:{items:ReportRow[];total:number;offset:number}};
+ reportGet:{args:{id:string};result:ReportDetail};
+ snapshotTake:{args:Record<string,unknown>;result:SnapshotRecord};
+ snapshotPrune:{args:{days?:number};result:{removed:number}};
  toolDefinition:{args:{id:string;sessionId?:string};result:ToolRecord};
  toolUsage:{args:{id:string;toolId:string;version:string;outcome:'succeeded'|'failed'};result:unknown};
  toolReview:{args:Record<string,unknown>;result:ToolReviewRow[]};

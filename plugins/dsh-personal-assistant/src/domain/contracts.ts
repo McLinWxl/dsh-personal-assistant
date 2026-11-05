@@ -13,11 +13,14 @@ export const settingsSchema = z.strictObject({
   maintenanceHour: z.number().int().min(0).max(23), maintenanceEnabled: z.boolean(),
   maintenanceMaxItems: z.number().int().min(1).max(500), maintenanceMaxSeconds: z.number().int().min(30).max(1800),
   contextCharacters: z.number().int().min(1000).max(32000), rollbackMegabytes: z.number().int().min(5).max(2048),
+  reportEnabled: z.boolean().default(true), reportHour: z.number().int().min(0).max(23).default(7),
+  snapshotDays: z.number().int().min(1).max(90).default(7), changeSummaryDays: z.number().int().min(1).max(365).default(90),
   model: z.string().max(160), basePreset: z.string().min(1).max(100), workspace: z.string().max(2000),
 });
 export const defaults = { timezone: 'Asia/Shanghai', retentionHours: 72, rawDays: 90, maintenanceHour: 3,
   maintenanceEnabled: true, maintenanceMaxItems: 80, maintenanceMaxSeconds: 180, contextCharacters: 12000,
-  rollbackMegabytes: 100, model: '', basePreset: 'default', workspace: '' };
+  rollbackMegabytes: 100, reportEnabled: true, reportHour: 7, snapshotDays: 7, changeSummaryDays: 90,
+  model: '', basePreset: 'default', workspace: '' };
 export type Settings = z.infer<typeof settingsSchema>;
 
 export const projectSchema = z.strictObject({ title: text, goal: z.string().max(10000).default(''),
@@ -68,9 +71,17 @@ export const schemas = {
   memorySearch: z.strictObject({ query:text, projectId:id.optional(), purpose:z.enum(['personal','external']).default('personal'), limit:z.number().int().min(1).max(30).default(12) }),
   related: z.strictObject({ projectId:id }), associate: z.strictObject({ projectId:id, memories:z.array(version).max(30) }),
   consolidate: z.strictObject({ groups:z.array(z.strictObject({ memories:z.array(version).min(2).max(20), canonicalFacts:z.array(fact).min(1).max(50) })).max(20) }),
-  maintain: z.strictObject({}), changes: z.strictObject({ offset:z.number().int().nonnegative().default(0) }), change: z.strictObject({ id }), undo:z.strictObject({ id }), redo:z.strictObject({ id }),
+  maintain: z.strictObject({}), changes: z.strictObject({ offset:z.number().int().nonnegative().default(0) }), change: z.strictObject({ id }),
+  reportWindow: z.strictObject({ from: z.number().int().optional() }),
+  reportSave: z.strictObject({ from: z.number().int(), to: z.number().int(), summary: z.any(), items: z.array(z.any()), conversationId: z.string().optional(), sessionId: z.string().optional(), messageId: z.string().optional(), snapshotId: z.string().optional(), body: z.string() }),
+  reportRevise: z.strictObject({ id: z.string(), body: z.string(), summary: z.any().optional(), items: z.array(z.any()).optional() }),
+  reportConfirm: z.strictObject({ id: z.string() }),
+  reportList: z.strictObject({ offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(50).default(20) }),
+  reportGet: z.strictObject({ id: z.string() }),
+  snapshotTake: z.strictObject({}),
+  snapshotPrune: z.strictObject({ days: z.number().int().min(1).max(90).optional() }),
   remove: z.strictObject({ id, revision:z.number().int() }),
-  memoryRemove:z.strictObject({id,revision:z.number().int()}),allowMerge:z.strictObject({id}),
+  memoryRemove:z.strictObject({id,revision:z.number().int()}),
   taskCreate:taskSchema, taskEdit:z.strictObject({id,revision:z.number().int(),patch:patchSchema(taskSchema)}),
   eventOverride:z.strictObject({id,revision:z.number().int(),occurrence:z.string().min(10).max(45),cancelled:z.boolean().default(false),patch:patchSchema(eventSchema).default({})}),
   eventCreate:eventSchema, eventEdit:z.strictObject({id,revision:z.number().int(),patch:patchSchema(eventSchema)}),
