@@ -199,9 +199,9 @@ export class AssistantService {
   private async buildReport(options:{trigger:'schedule'|'manual'}){
    const settings=await this.command('settingsGet',{});
    if(options.trigger==='schedule'&&settings.reportEnabled===false)return null;
-   const window=await this.storage.call('reportWindow',{}) as ReportWindowResult,items=Array.isArray(window.items)?window.items:[];
+   const window=await this.command('reportWindow',{}) as ReportWindowResult,items=Array.isArray(window.items)?window.items:[];
    const date=this.reportDate(Date.now(),settings.timezone),data=await this.reportData(window,settings,date);
-   let snapshotId:string|undefined;try{snapshotId=(await this.storage.call('snapshotTake',{}) as SnapshotRecord)?.id;}catch(e){this.report(e);}
+   let snapshotId:string|undefined;try{snapshotId=(await this.command('snapshotTake',{}) as SnapshotRecord)?.id;}catch(e){this.report(e);}
    const session=await this.createConversation('日报 · '+date,true);
    const agent=this.ctx.agents.get(session.sessionId);if(!agent)throw new Error('SESSION_NOT_STARTED');this.reportRuns.add(agent.id);
    let body='',messageId:string|undefined;
@@ -215,9 +215,9 @@ export class AssistantService {
     body=messageText(assistant?.data?.message??{}).trim();messageId=assistant?.data?.message?.id;
    }finally{this.reportRuns.delete(agent.id);}
    if(!body)body=this.reportWeixinText(date,window);
-   const saved=await this.storage.call('reportSave',{from:window.from,to:window.to,summary:window.summary,items,sessionId:session.sessionId,messageId,snapshotId,body}) as {id:string};
+   const saved=await this.command('reportSave',{from:window.from,to:window.to,summary:window.summary,items,sessionId:session.sessionId,messageId,snapshotId,body}) as {id:string};
    await this.pushReport(saved.id,this.reportWeixinText(date,window));
-   return this.storage.call('reportGet',{id:saved.id});
+   return this.command('reportGet',{id:saved.id});
   }
  async maintenance(){if(this.maintenancePending)return{skipped:true,busy:true};this.maintenancePending=this.performMaintenance();try{return await this.maintenancePending;}catch(e:any){try{await this.publishReport({status:'failed',error:e.message,changesCommitted:e.changesCommitted??null});}catch(reportError){this.report(reportError);}throw e;}finally{this.maintenancePending=undefined;}}
  async captureProjects(){
