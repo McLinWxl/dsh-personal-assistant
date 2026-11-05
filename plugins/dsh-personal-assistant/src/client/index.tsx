@@ -15,6 +15,8 @@ import type {
   ReactNode,
 } from 'react';
 import styles from './style.css';
+import {ProjectPage, TreeDiffView} from './projects.js';
+import type {TreeChange} from '../domain/project-types.js';
 
 export const name = 'personal-assistant-client';
 export const inject = ['slots', 'connection', 'locale', 'layout', 'uiWorkspace'];
@@ -35,7 +37,7 @@ type Api = <T = unknown>(method: string, payload?: Payload) => Promise<T>;
 interface RpcResponse {
   ok?: boolean;
   value?: unknown;
-  error?: { message?: string };
+  error?: { message?: string; code?: string; details?: unknown };
 }
 
 const command = async <T,>(
@@ -266,7 +268,7 @@ function projectColor(projectId: string | null | undefined): string | undefined 
 interface RowData {
   title?: string;
   body?: string;
-  goal?: string;
+  statement?: string;
   description?: string;
   notes?: string;
   status?: string;
@@ -280,7 +282,6 @@ interface RowData {
   urgent?: boolean;
   derivedDirty?: boolean;
   dueAt?: string | null;
-  projectId?: string | null;
   start?: string;
   end?: string;
   allDay?: boolean;
@@ -309,6 +310,7 @@ interface RowData {
 }
 
 interface Row {
+  projectId?: string | null;
   id: string;
   revision: number;
   kind?: string;
@@ -376,6 +378,7 @@ interface ReportRow {
 }
 
 interface ReportItem {
+  metadata?: { treeDiff?: TreeChange; gap?: Record<string, unknown> };
   id: string;
   kind: string;
   objectId: string | null;
@@ -582,7 +585,7 @@ interface WeixinState {
 interface FormState {
   title: string;
   body: string;
-  goal: string;
+  statement: string;
   description: string;
   notes: string;
   status: string;
@@ -640,7 +643,7 @@ function formFromRow(
   return {
     title: data.title ?? '',
     body: data.body ?? '',
-    goal: data.goal ?? '',
+    statement: data.statement ?? '',
     description: data.description ?? '',
     notes: data.notes ?? '',
     status: data.status ?? (kind === 'project' ? 'active' : 'todo'),
@@ -657,7 +660,7 @@ function formFromRow(
     domainsText: (data.domains ?? []).join('，'),
     importance: data.importance ?? 3,
     pinned: data.pinned ?? false,
-    projectId: data.projectId ?? '',
+    projectId: row?.projectId ?? '',
     stepsText: JSON.stringify(data.steps ?? [], null, 2),
     source: data.source ?? '',
     language: data.language ?? 'javascript',
@@ -715,7 +718,7 @@ function makeEventForm(
       instanceEnd ||
       seriesEnd ||
       (day ? `${day}T10:00` : localInput(Date.now() + 3600000, timezone)),
-    projectId: data.projectId ?? '',
+    projectId: row?.projectId ?? '',
   };
 }
 
@@ -724,7 +727,7 @@ function recordPayload(kind: Kind, form: FormState, timezone: string): Payload {
   if (kind === 'project') {
     return {
       title: form.title,
-      goal: form.goal,
+      statement: form.statement,
       domains,
       status: form.status,
     };
@@ -783,8 +786,8 @@ async function persistRecord(
   if (kind === 'tool') {
     const definition = data as Record<string, unknown>;
     await command(api, 'toolSave', form.id
-      ? { id: form.id, revision: form.revision, definition }
-      : { definition });
+      ? { id: form.id, revision: form.revision, projectId: form.projectId || null, definition }
+      : { projectId: form.projectId || null, definition });
     return;
   }
   if (kind === 'memory' && !form.id) {
@@ -1316,7 +1319,7 @@ function statusText(kind: Kind, data: RowData): string {
 
 function bodyTextOf(kind: Kind, data: RowData): string {
   if (kind === 'memory') return data.body ?? '';
-  if (kind === 'project') return data.goal ?? '';
+  if (kind === 'project') return data.statement ?? '';
   if (kind === 'task') return data.description ?? '';
   return data.description ?? '';
 }
@@ -1370,8 +1373,8 @@ function EditorFields({ kind, form, update, projects, timezone }: EditorFieldsPr
         <>
           <TextField
             label="目标"
-            value={form.goal}
-            onChange={(value) => update({ goal: value })}
+            value={form.statement}
+            onChange={(value) => update({ statement: value })}
             multiline
           />
           <Field label="状态">
@@ -1875,8 +1878,8 @@ function RecordDialog({
     meta.push({ label: '领域', value: (data.domains ?? []).join('、') });
   }
   if (data.dueAt) meta.push({ label: '截止', value: formatDate(data.dueAt, timezone) });
-  if (data.projectId) {
-    const project = projects.find((item) => item.id === data.projectId);
+  if (row?.projectId) {
+    const project = projects.find((item) => item.id === row?.projectId);
     if (project) meta.push({ label: '项目', value: project.data.title ?? '' });
   }
   if (kind === 'event' && data.start) {
@@ -1884,16 +1887,16 @@ function RecordDialog({
   }
   if (data.location) meta.push({ label: '地点', value: data.location });
 
-  const projectName = data.projectId
-    ? projects.find((item) => item.id === data.projectId)?.data.title ?? ''
+  const projectName = row?.projectId
+    ? projects.find((item) => item.id === row?.projectId)?.data.title ?? ''
     : '';
   const facts = data.canonicalFacts ?? data.facts ?? [];
   const memoryRelations = relations.filter((relation) => relation.object.kind === 'memory');
   const otherRelations = relations.filter((relation) => relation.object.kind !== 'memory');
   const relationLabel = (relation: Relation) =>
     ({
-      belongs_to: '所属',
-      reuses_method: '复用',
+      contains: '所属',
+      applies_to: '复用',
       about: '主题',
       related_to: '相关',
     })[relation.kind] ?? relation.kind;
@@ -2032,7 +2035,7 @@ function RecordDialog({
             <section className="pa-detail-section pa-detail-first">
               <h3>概览</h3>
               {metaNode}
-              {data.goal && <p className="pa-detail-body">{data.goal}</p>}
+              {data.statement && <p className="pa-detail-body">{data.statement}</p>}
               <div className="pa-tags">
                 <span className="pa-tag">记忆 {projectCounts.memory}</span>
                 <span className="pa-tag">任务 {projectCounts.task}</span>
@@ -2259,11 +2262,11 @@ function RecordDialog({
 /* ------------------------------------------------------------------ */
 
 function changeActionLabel(action: string): string {
-  if (action === 'created') return '创建';
-  if (action === 'updated') return '更新';
-  if (action === 'deleted') return '删除';
-  if (action === 'merged') return '合并';
-  return action || '变更';
+  const labels: Record<string,string> = {created:'创建',updated:'更新',deleted:'删除',removed:'删除',merged:'合并',
+    moved:'移动',split:'拆分',renamed:'改名',archived:'归档',restored:'恢复',attached:'关联',detached:'解除关联',
+    bound:'会话归属',unresolved:'未决',failed:'失败',applied:'已执行',open:'待处理',planned:'已规划',resolved:'已解决',
+    dismissed:'已关闭',ran:'已运行',confirmed:'已完成'};
+  return labels[action] ?? action ?? '变更';
 }
 
 function changeStatusLabel(status: string): string {
@@ -2395,7 +2398,7 @@ function MemoryTimeline({
           <div className="pa-timeline-month-label">{month}</div>
           <div className="pa-timeline-items">
             {items.map((row) => {
-              const project = projectTitle(row.data.projectId);
+              const project = projectTitle(row.projectId);
               const observed = row.data.observations?.at(-1)?.at ?? updatedTime(row);
               return (
                 <article key={row.id} className="pa-timeline-item">
@@ -2973,19 +2976,14 @@ function DataHealth({ api, root }: { api: Api; root: string }) {
               <strong>{rootPath || '—'}</strong>
             </div>
           </div>
-          <p className="pa-health-note">
-            {integrity && !integrityOk
-              ? '数据库完整性检查发现问题，建议先导出备份再排查。'
-              : '完整性正常时，节点与边应随整理持续增长；外键错误应为 0。'}
-          </p>
           <p className="pa-export-note">
             {lastExport
               ? `最近导出：${lastExport.name} · ${formatDate(lastExport.at)}`
-              : '还没有导出记录，建议定期备份。'}
+              : '暂无导出记录'}
           </p>
           <div className="pa-settings-footer">
             <button type="button" onClick={() => void openDirectory()}>
-              打开数据目录
+              复制目录路径
             </button>
             <button type="button" disabled={busy === 'maintain'} onClick={() => void maintain()}>
               {busy === 'maintain' ? '整理中…' : '立即整理'}
@@ -2999,181 +2997,9 @@ function DataHealth({ api, root }: { api: Api; root: string }) {
               {busy === 'export' ? '导出中…' : '导出数据'}
             </button>
           </div>
-          <p className="pa-meta">「打开数据目录」会复制路径；受浏览器限制，无法直接打开访达。</p>
         </>
       )}
     </section>
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* First-run onboarding                                                */
-/* ------------------------------------------------------------------ */
-
-function Onboarding({
-  api,
-  root,
-  overview,
-  onFinish,
-  onGoSettings,
-}: {
-  api: Api;
-  root: string;
-  overview: Overview | null;
-  onFinish: () => void;
-  onGoSettings: () => void;
-}) {
-  const notify = useToast();
-  const [step, setStep] = useState(0);
-  const [wechat, setWechat] = useState<WeixinState | null>(null);
-  const [busy, setBusy] = useState('');
-
-  useEffect(() => {
-    if (step !== 2) return;
-    let live = true;
-    api<WeixinState>('weixin.status')
-      .then((value) => {
-        if (live) setWechat(value);
-      })
-      .catch(() => {
-        if (live) setWechat(null);
-      });
-    return () => {
-      live = false;
-    };
-  }, [api, step]);
-
-  const path = overview?.dataRoot || root;
-  const settings = overview?.settings;
-
-  const exportData = async () => {
-    setBusy('export');
-    try {
-      const record = await exportBackup(api);
-      if (!record) return;
-      try {
-        localStorage.setItem('pa.lastExport', JSON.stringify(record));
-      } catch {
-        /* ignore storage failures */
-      }
-      notify(`已导出 ${record.name}`);
-    } catch (err) {
-      notify(message(err), { tone: 'error' });
-    } finally {
-      setBusy('');
-    }
-  };
-
-  const copyPath = async () => {
-    if (!path) return;
-    const ok = await copyText(path);
-    notify(ok ? '数据目录路径已复制。' : '复制失败。', { tone: ok ? 'info' : 'error' });
-  };
-
-  const goSettings = () => {
-    onFinish();
-    onGoSettings();
-  };
-
-  const wechatText =
-    wechat?.status === 'connected'
-      ? `已连接${wechat.account ? `：${wechat.account}` : ''}`
-      : wechat?.status === 'waiting'
-        ? '等待扫码'
-        : '未连接';
-
-  return (
-    <Modal title="欢迎使用个人助手" onClose={onFinish} wide>
-      <div className="pa-wizard">
-        <div className="pa-steps" aria-hidden="true">
-          {[0, 1, 2].map((value) => (
-            <span key={value} className={cx('pa-step-dot', value <= step && 'pa-on')} />
-          ))}
-        </div>
-        {step === 0 && (
-          <>
-            <h3>① 数据目录与备份</h3>
-            <p>记忆、任务和整理记录都保存在本机数据目录中：</p>
-            <span className="pa-wizard-path">{path || '尚未选择数据目录'}</span>
-            <ul>
-              <li>建议定期导出备份，导出的压缩包可以随时恢复或归档。</li>
-              <li>数据目录可以随时在「设置 → 数据与迁移」中更换。</li>
-              <li>助手不会把数据上传到云端；模型调用只发送当前需要的上下文。</li>
-            </ul>
-            <div className="pa-actions">
-              <button type="button" onClick={() => void copyPath()} disabled={!path}>
-                复制目录路径
-              </button>
-              <button type="button" onClick={() => void exportData()} disabled={busy === 'export'}>
-                {busy === 'export' ? '导出中…' : '立即导出备份'}
-              </button>
-            </div>
-          </>
-        )}
-        {step === 1 && (
-          <>
-            <h3>② 模型与基础助手</h3>
-            <p>
-              当前模型：
-              <strong>{settings?.model || '跟随 DSH 默认模型'}</strong>
-            </p>
-            <p>
-              基础助手：
-              <strong>{settings?.basePreset || '跟随 DSH 默认助手'}</strong>
-            </p>
-            <ul>
-              <li>模型和基础助手决定「立即整理」与对话式助手的表现。</li>
-              <li>可以稍后在「设置 → 助手工作区」中调整。</li>
-            </ul>
-            <div className="pa-actions">
-              <button type="button" onClick={goSettings}>
-                前往助手设置
-              </button>
-            </div>
-          </>
-        )}
-        {step === 2 && (
-          <>
-            <h3>③ 微信连接（可跳过）</h3>
-            <p>
-              状态：<strong>{wechatText}</strong>
-            </p>
-            <ul>
-              <li>连接微信后，可以直接把聊天里的想法转发给助手整理。</li>
-              <li>连接需要扫码，也可以稍后在「设置 → 微信」中完成。</li>
-            </ul>
-            <div className="pa-actions">
-              <button type="button" onClick={goSettings}>
-                前往微信设置
-              </button>
-            </div>
-          </>
-        )}
-        <div className="pa-wizard-actions">
-          <button type="button" onClick={onFinish}>
-            跳过
-          </button>
-          {step > 0 && (
-            <button type="button" onClick={() => setStep((value) => value - 1)}>
-              上一步
-            </button>
-          )}
-          {step < 2 ? (
-            <button
-              type="button"
-              className="pa-primary"
-              onClick={() => setStep((value) => value + 1)}
-            >
-              下一步
-            </button>
-          ) : (
-            <button type="button" className="pa-primary" onClick={onFinish}>
-              完成
-            </button>
-          )}
-        </div>
-      </div>
-    </Modal>
   );
 }
 
@@ -3268,7 +3094,7 @@ function Records({
   }, [refresh]);
 
   useEffect(() => {
-    void command<ListResult>(api, 'list', { kind: 'project', limit: 100 })
+    void command<ListResult>(api, 'projectTree', {})
       .then((data) => setProjects(data.items))
       .catch((errorValue) => setError(message(errorValue)));
   }, [api]);
@@ -3524,7 +3350,7 @@ function Records({
   const dependency = (id: string) => rows.find((row) => row.id === id) ?? extraDeps[id];
   const quickCreate = (taskKind: 'task', projectId: string) => {
     setSelected(null);
-    setCreateSeed({ id: '', revision: 0, data: { projectId } });
+    setCreateSeed({ id: '', revision: 0, projectId, data: {} });
     setCreateOpen(true);
   };
 
@@ -3624,9 +3450,9 @@ function Records({
                   {row.data.important && <span className="pa-tag">重要</span>}
                   {row.data.urgent && <span className="pa-tag pa-warm">紧急</span>}
                   {row.data.derivedDirty && <span className="pa-tag">待整理</span>}
-                  {row.data.projectId && (
+                  {row.projectId && (
                     <span className="pa-tag">
-                      {projects.find((item) => item.id === row.data.projectId)?.data.title ??
+                      {projects.find((item) => item.id === row.projectId)?.data.title ??
                         '项目'}
                     </span>
                   )}
@@ -3895,7 +3721,7 @@ function Records({
       )}
       {createOpen && (
         <RecordDialog
-          key={`create:${createSeed?.data.projectId ?? ''}`}
+          key={`create:${createSeed?.projectId ?? ''}`}
           api={api}
           kind={kind}
           create
@@ -4141,7 +3967,7 @@ function Calendar({
   }, [refresh]);
 
   useEffect(() => {
-    void command<ListResult>(api, 'list', { kind: 'project', limit: 100 })
+    void command<ListResult>(api, 'projectTree', {})
       .then((data) => setProjects(data.items))
       .catch((errorValue) => setError(message(errorValue)));
   }, [api]);
@@ -4178,7 +4004,7 @@ function Calendar({
 
   const filtered = rows.filter(
     (row) =>
-      (!project || row.data.projectId === project) &&
+      (!project || row.projectId === project) &&
       (!domain || (row.data.domains ?? []).includes(domain)),
   );
   const domains = [...new Set(rows.flatMap((row) => row.data.domains ?? []))];
@@ -4453,7 +4279,7 @@ function Calendar({
                   <button
                     type="button"
                     className="pa-event"
-                    style={{ borderLeftColor: projectColor(row.data.projectId) }}
+                    style={{ borderLeftColor: projectColor(row.projectId) }}
                     key={`${row.id}:${row.occurrenceStart ?? ''}`}
                     onClick={() => open(row)}
                   >
@@ -4477,7 +4303,7 @@ function Calendar({
             <article
               className="pa-card"
               key={`${row.id}:${row.occurrenceStart ?? ''}`}
-              style={{ borderLeftColor: projectColor(row.data.projectId) }}
+              style={{ borderLeftColor: projectColor(row.projectId) }}
             >
               <button type="button" className="pa-title" onClick={() => open(row)}>
                 {row.data.title}
@@ -4540,9 +4366,9 @@ function Calendar({
 /* ------------------------------------------------------------------ */
 
 const REPORT_STATUS_LABEL: Record<ReportStatus, string> = {
-  draft: '待确认',
-  confirmed: '已确认',
-  'auto-confirmed': '已确认',
+  draft: '未读',
+  confirmed: '已读',
+  'auto-confirmed': '已读',
   superseded: '已归档',
 };
 
@@ -4555,6 +4381,11 @@ const REPORT_KIND_LABEL: Record<string, string> = {
   tool: '工具',
   entity: '实体',
   notification: '通知',
+  relation: '关联',
+  capability: '能力缺口',
+  maintenance: '整理',
+  run: '执行',
+  wechat: '微信',
 };
 
 function reportKindLabel(kind: string): string {
@@ -4607,7 +4438,7 @@ function reportBreakdown(row: ReportRow): {
 function reportCountsText(row: ReportRow): string {
   const counts = reportBreakdown(row);
   const total = Number.isFinite(row.counts) ? row.counts : 0;
-  if (total <= 0) return '这份日报没有明细。';
+  if (total <= 0) return '暂无明细';
   const known = counts.memory + counts.project + counts.task + counts.event + counts.other;
   if (known <= 0) return `共 ${total} 项`;
   return `共 ${total} 项：记忆 ${counts.memory} · 项目 ${counts.project} · 任务 ${counts.task} · 日程 ${counts.event} · 其余 ${counts.other}`;
@@ -4662,7 +4493,10 @@ function ReportItemsTable({ items }: { items: ReportItem[] }) {
                 {item.title || '未命名'}
                 {item.action && <span className="pa-meta"> · {changeActionLabel(item.action)}</span>}
               </td>
-              <td className="pa-meta">{item.detail || '—'}</td>
+              <td className="pa-meta">{item.metadata?.treeDiff ? <TreeDiffView changes={[item.metadata.treeDiff]} /> : <>
+                {item.detail || '—'}
+                {Array.isArray(item.metadata?.gap?.proposals) && (item.metadata.gap.proposals as Array<{id:string;title:string;plan:string}>).map(proposal=><details key={proposal.id}><summary>{proposal.title}</summary><p>{proposal.plan}</p></details>)}
+              </>}</td>
             </tr>
           ))}
         </tbody>
@@ -4789,12 +4623,6 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
   };
 
   const confirmReport = async (row: ReportRow) => {
-    const ok = await confirm({
-      title: '确认这份日报？',
-      body: `确认后「${reportDay(row.windowFrom, timezone)} – ${reportDay(row.windowTo, timezone)}」的日报会标记为已确认。`,
-      confirmLabel: '确认',
-    });
-    if (!ok) return;
     setBusy(`confirm:${row.id}`);
     try {
       const next = await command<ReportRow>(api, 'reportConfirm', { id: row.id });
@@ -4805,7 +4633,7 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
             : item,
         ),
       );
-      notify('已确认');
+      notify('已标记已读');
       await loadList();
       if (selectedId === row.id) await loadDetail(row.id);
     } catch (err) {
@@ -4863,6 +4691,9 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
     const currentVersion = versions.find((item) => item.revision === version);
     const body = currentVersion?.body ?? active?.body ?? row.body;
     const items = active?.items ?? [];
+    const changes = items.filter(item => item.metadata?.treeDiff);
+    const gaps = items.filter(item => item.kind === 'capability');
+    const otherItems = items.filter(item => !item.metadata?.treeDiff && item.kind !== 'capability');
     return (
       <div className="pa-report-detail-content">
         <div className="pa-report-detail-meta">
@@ -4872,7 +4703,7 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
           <span className="pa-meta">修订 #{row.revision}</span>
           <span className="pa-meta">生成于 {formatDate(row.createdAt, timezone)}</span>
           {row.confirmedAt && (
-            <span className="pa-meta">确认于 {formatDate(row.confirmedAt, timezone)}</span>
+            <span className="pa-meta">已读于 {formatDate(row.confirmedAt, timezone)}</span>
           )}
         </div>
         {versions.length > 1 && (
@@ -4898,22 +4729,10 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
             {detailError}
           </div>
         )}
-        {body ? <ReportBody body={body} /> : <p className="pa-detail-note">这份日报还没有正文。</p>}
-        {items.length > 0 && (
-          <section className="pa-report-items">
-            <h3>
-              明细<span className="pa-count">{items.length}</span>
-            </h3>
-            {items.length > 30 ? (
-              <details className="pa-report-all">
-                <summary>全部 {items.length} 项</summary>
-                <ReportItemsTable items={items} />
-              </details>
-            ) : (
-              <ReportItemsTable items={items} />
-            )}
-          </section>
-        )}
+        {body ? <ReportBody body={body} /> : <p className="pa-detail-note">暂无正文</p>}
+        {changes.length > 0 && <section className="pa-report-items"><h3>项目变化 <span className="pa-count">{changes.length}</span></h3><TreeDiffView changes={changes.map(item=>item.metadata!.treeDiff!)}/></section>}
+        <section className="pa-report-items"><h3>能力缺口 <span className="pa-count">{gaps.length}</span></h3>{gaps.length ? <ReportItemsTable items={gaps}/> : <span className="pa-meta">无</span>}</section>
+        {otherItems.length > 0 && <section className="pa-report-items"><h3>其他明细 <span className="pa-count">{otherItems.length}</span></h3><ReportItemsTable items={otherItems}/></section>}
         <div className="pa-report-detail-actions">
           <button type="button" className="pa-text-button" onClick={() => openReport(row)}>
             打开会话
@@ -4925,7 +4744,7 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
               disabled={busy !== ''}
               onClick={() => void confirmReport(row)}
             >
-              {busy === `confirm:${row.id}` ? '确认中…' : '确认这份'}
+              {busy === `confirm:${row.id}` ? '处理中…' : '标记已读'}
             </button>
           )}
         </div>
@@ -4962,7 +4781,7 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
             disabled={busy !== ''}
             onClick={() => void confirmReport(row)}
           >
-            {busy === `confirm:${row.id}` ? '确认中…' : '确认这份'}
+            {busy === `confirm:${row.id}` ? '处理中…' : '标记已读'}
           </button>
         )}
       </footer>
@@ -4976,7 +4795,6 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
       <div className="pa-page-heading">
         <div>
           <h2>日报</h2>
-          <p className="pa-meta">每天 07:00 自动生成；在日报会话里回复，助手会修订内容。</p>
         </div>
         <div className="pa-actions">
           {generating && (
@@ -4994,7 +4812,7 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
         <SkeletonCards />
       ) : rows.length === 0 ? (
         <EmptyState
-          text="还没有日报。每天 07:00 会自动生成一份；也可以现在生成。"
+          text="暂无日报"
           actionLabel="现在生成"
           onAction={() => void generate()}
         />
@@ -5020,7 +4838,7 @@ function ReportPage({ api, timezone, wide }: ReportPageProps) {
               {renderDetail(selected)}
             </section>
           ) : (
-            <div className="pa-split-empty">从左侧选择一份日报，在这里查看详情。</div>
+            <div className="pa-split-empty">选择日报</div>
           )}
         </div>
       ) : (
@@ -5046,7 +4864,7 @@ function activityText(change: ChangeRecord): string {
   const count = change.summary?.changedObjects;
   const label = change.summary?.type === 'change' ? '变更' : '整理';
   const base = typeof count === 'number' && count > 0 ? `${label}了 ${count} 项` : `${label}已完成`;
-  return change.status.startsWith('und') ? `${base}（已撤回）` : base;
+  return base;
 }
 
 interface TodayProps {
@@ -5346,7 +5164,6 @@ function Settings({
   onBack,
   density,
   onDensityChange,
-  onShowOnboarding,
   onShowHelp,
 }: {
   api: Api;
@@ -5354,7 +5171,6 @@ function Settings({
   onBack: () => void;
   density: Density;
   onDensityChange: (value: Density) => void;
-  onShowOnboarding: () => void;
   onShowHelp: () => void;
 }) {
   const [settings, setSettings] = useState<AssistantSettings | null>(null);
@@ -5662,9 +5478,6 @@ function Settings({
                 {reportNumberField('snapshotDays', '快照保留天数', 1, 90)}
                 {reportNumberField('changeSummaryDays', '变更摘要保留天数', 1, 365)}
               </div>
-              <p className="pa-hint">
-                报告每天 07:00 生成并推送到微信；可在日报会话里直接提出修改。
-              </p>
             </div>
             {saveButton}
           </section>
@@ -5752,11 +5565,7 @@ function Settings({
                   </button>
                 </div>
               </Field>
-              <p className="pa-hint">
-                紧凑模式会收紧列表、卡片与详情的行高和间距，适合在信息密集时使用；选择会保存在本机。
-              </p>
               <div className="pa-actions">
-                <button type="button" onClick={onShowOnboarding}>重新查看引导</button>
                 <button type="button" onClick={onShowHelp}>快捷键帮助</button>
               </div>
             </div>
@@ -5980,7 +5789,6 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
   const [entityId, setEntityId] = useState<string | null>(null);
-  const [onboarding, setOnboarding] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [density, setDensity] = useState<Density>(() => readDensity());
   const [wide, setWide] = useState(
@@ -6014,26 +5822,6 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
     query.addEventListener?.('change', onChange);
     return () => query.removeEventListener?.('change', onChange);
   }, []);
-
-  useEffect(() => {
-    if (!overview.dataRoot) return;
-    let onboarded = false;
-    try {
-      onboarded = localStorage.getItem('pa.onboarded') === '1';
-    } catch {
-      // Ignore unavailable storage.
-    }
-    if (!onboarded) setOnboarding(true);
-  }, [overview.dataRoot]);
-
-  const finishOnboarding = () => {
-    try {
-      localStorage.setItem('pa.onboarded', '1');
-    } catch {
-      // Ignore unavailable storage.
-    }
-    setOnboarding(false);
-  };
 
   const openSearchItem = (item: SearchItem) => {
     if (item.kind === 'entity') {
@@ -6231,7 +6019,7 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
             />
           )}
           {tab === 'memory' && <Records key="memory" kind="memory" {...recordProps} />}
-          {tab === 'project' && <Records key="project" kind="project" {...recordProps} />}
+          {tab === 'project' && <ProjectPage api={api} onCreateConsumed={()=>setCreateRequest(null)} onChange={refresh} focusId={focusRequest?.kind === 'project' ? focusRequest.id : undefined} createNonce={createRequest?.kind === 'project' ? createRequest.nonce : undefined} onOpen={(kind,id)=>openSearchItem({kind:kind as SearchKind,id,title:''})} />}
           {tab === 'task' && <Records key="task" kind="task" {...recordProps} />}
           {tab === 'tool' && <Records key="tool" kind="tool" {...recordProps} />}
           {tab === 'calendar' && (
@@ -6254,7 +6042,6 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
               onBack={() => setTab('today')}
               density={density}
               onDensityChange={setDensity}
-              onShowOnboarding={() => setOnboarding(true)}
               onShowHelp={() => setHelpOpen(true)}
             />
           )}
@@ -6340,18 +6127,6 @@ function App({ api, initialTab = 'today' }: { api: Api; initialTab?: string }) {
       {entityId && (
         <EntityPeek api={api} id={entityId} onClose={() => setEntityId(null)} />
       )}
-      {onboarding && (
-        <Onboarding
-          api={api}
-          root={overview.dataRoot}
-          overview={overview}
-          onFinish={finishOnboarding}
-          onGoSettings={() => {
-            setOnboarding(false);
-            setTab('settings');
-          }}
-        />
-      )}
     </main>
   );
 }
@@ -6403,7 +6178,7 @@ export function apply(ctx: PluginCtx) {
       method,
       payload,
     });
-    if (!result?.ok) throw new Error(result?.error?.message ?? '无法连接助手。');
+    if (!result?.ok) throw Object.assign(new Error(result?.error?.message ?? '无法连接助手。'), result?.error);
     return result.value as T;
   };
   ctx.effect(() => {

@@ -26,7 +26,7 @@ export async function buildPlugin() {
   const require = createRequire(import.meta.url), tz = require('@touch4it/ical-timezones');
   const names = Object.keys(require('@touch4it/ical-timezones/zones.js'));
   await writeFile(join(outdir, 'zones.json'), JSON.stringify(Object.fromEntries(names.map(name => [name, tz.getVtimezoneComponent(name)]))));
-  await buildNodeEntries({host: 'src/host/index.ts', agent: 'src/host/agent.ts', worker: 'src/storage/worker.ts'}, outdir);
+  await buildNodeEntries({host: 'src/host/index.ts', agent: 'src/host/agent.ts', worker: 'src/storage/worker.ts', 'migrate-v2': 'src/cli/migrate-v2.ts'}, outdir);
   const client = await build({
     entryPoints: [join(root, 'src/client/index.tsx')], bundle: true, format: 'cjs',
     platform: 'browser', target: 'chrome120', external: ['react', 'react-dom', 'react/jsx-runtime'],

@@ -52,7 +52,7 @@ export class MemoryStore {
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED, terms);
       CREATE TABLE IF NOT EXISTS requests(key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, result TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS changes(id TEXT PRIMARY KEY, created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL, status TEXT NOT NULL, summary TEXT NOT NULL, undo_result TEXT);
+        expires_at INTEGER NOT NULL, status TEXT NOT NULL, summary TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS deltas(change_id TEXT REFERENCES changes(id), position INTEGER,
         table_name TEXT NOT NULL, object_id TEXT NOT NULL, before_json TEXT, after_json TEXT,
         after_revision INTEGER NOT NULL, PRIMARY KEY(change_id,position));
@@ -76,24 +76,25 @@ export class MemoryStore {
     requireString(key);
     const fingerprint = digest(payload);
     const outer = !this.db.isTransaction;
-    if (outer) this.db.exec('BEGIN IMMEDIATE');
+    const savepoint = 'command_' + randomUUID().replaceAll('-', '');
+    this.db.exec(outer ? 'BEGIN IMMEDIATE' : `SAVEPOINT ${savepoint}`);
     let committed = false;
     try {
       const prior = this.db.prepare('SELECT * FROM requests WHERE key=?').get(key);
       if (prior) {
         if (prior.fingerprint !== fingerprint) fail('REQUEST_KEY_REUSED');
-        if (outer) this.db.exec('COMMIT'); committed = true;
+        this.db.exec(outer ? 'COMMIT' : `RELEASE ${savepoint}`); committed = true;
         return JSON.parse(prior.result);
       }
       const result = execute();
       if (this.db.prepare('PRAGMA foreign_key_check').all().length) fail('BROKEN_REFERENCE');
       this.db.prepare('INSERT INTO requests VALUES(?,?,?)').run(key, fingerprint, JSON.stringify(result));
       if (outer) this.fault('before-commit');
-      if (outer) this.db.exec('COMMIT'); committed = true;
+      this.db.exec(outer ? 'COMMIT' : `RELEASE ${savepoint}`); committed = true;
       if (outer) this.fault('after-commit');
       return result;
     } catch (error) {
-      if (!committed && outer) this.db.exec('ROLLBACK');
+      if (!committed) this.db.exec(outer ? 'ROLLBACK' : `ROLLBACK TO ${savepoint}; RELEASE ${savepoint}`);
       throw error;
     }
   }
@@ -128,7 +129,7 @@ export class MemoryStore {
     if (data === null) {
       this.db.prepare(`DELETE FROM ${table} WHERE id=?`).run(id);
     } else if (table === 'nodes') {
-      this.db.prepare('INSERT OR REPLACE INTO nodes VALUES(?,?,?,?,?)')
+      this.db.prepare('INSERT INTO nodes VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,data=excluded.data,clocks=excluded.clocks,revision=excluded.revision')
         .run(id, kind, JSON.stringify(data), JSON.stringify(clocks), revision);
     } else {
       const { from, to, ...rest } = data;
@@ -141,16 +142,6 @@ export class MemoryStore {
         .run(id, tokens([data.title, data.body, JSON.stringify(data.derivedDirty ? [] : data.facts ?? []), JSON.stringify(data.derivedDirty || data.manualFields?.includes('body') ? [] : data.originalClaims ?? []), ...(data.topics ?? [])].join(' ')).join(' '));
     }
     return { record: this.get(table, id), revision };
-  }
-
-  createProject(data, key) {
-    requireString(data.title); requireString(data.owner);
-    if (!Array.isArray(data.domains) || !data.context || typeof data.context !== 'object') fail('INVALID_INPUT');
-    return this.command(key, { action: 'create-project', data }, () => {
-      const id = randomUUID();
-      this.put('nodes', id, 'project', { ...clone(data), createdAt: this.now() });
-      return { id };
-    });
   }
 
   captureMemory(data, key) {
@@ -179,54 +170,6 @@ export class MemoryStore {
       const found = this.all('edges').find(e => e.data.from === from && e.data.to === to && e.data.kind === kind);
       if (found) return { id: found.id };
       const id = randomUUID(); this.put('edges', id, 'edge', { from, to, kind }); return { id };
-    });
-  }
-
-  findRelated(projectId) {
-    const project = this.get('nodes', projectId);
-    if (project?.kind !== 'project') fail('PROJECT_NOT_FOUND');
-    const query = tokens([project.data.title, project.data.goal, ...(project.data.topics ?? [])].join(' '));
-    if (!query.length) return [];
-    const expression = query.map(t => `"${t.replaceAll('"', '""')}"`).join(' OR ');
-    const now = this.now();
-    // Filter identity/applicability BEFORE truncating; unrelated private hits cannot crowd out valid ones.
-    return this.db.prepare('SELECT id, bm25(memory_search) AS rank FROM memory_search WHERE memory_search MATCH ? ORDER BY rank,id')
-      .all(expression).flatMap(({ id, rank }) => {
-        const memory = this.get('nodes', id); const d = memory.data;
-        if (d.owner !== project.data.owner || d.visibility !== 'personal') return [];
-        if (d.validFrom && Date.parse(d.validFrom) > now || d.validTo && Date.parse(d.validTo) <= now) return [];
-        if (Object.entries(d.requirements).some(([k, v]) => !equal(project.data.context[k], v))) return [];
-        return [{ id, rank, observations: d.observations, title: d.title,
-          matched: query.filter(t => tokens([d.title, d.body, ...(d.topics ?? [])].join(' ')).includes(t)) }];
-      }).slice(0, 12);
-  }
-
-  associate(projectId, key) {
-    return this.command(key, { action: 'associate', projectId }, () => {
-      const candidates = this.findRelated(projectId);
-      const links = [];
-      for (const candidate of candidates) {
-        if (this.all('edges').some(e => e.data.from === projectId && e.data.to === candidate.id && e.data.kind === 'reuses_method')) continue;
-        const id = randomUUID();
-        this.put('edges', id, 'edge', { from: projectId, to: candidate.id, kind: 'reuses_method' });
-        links.push(id);
-      }
-      return { projectId, memoryIds: candidates.map(c => c.id), createdLinks: links.length };
-    });
-  }
-
-  associateSelected(projectId, versions, key) {
-    return this.command(key, { action: 'associate-selected', projectId, versions }, () => {
-      const candidates = new Set(this.findRelated(projectId).map(c => c.id));
-      const links = [];
-      for (const { id, revision } of versions) {
-        if (!candidates.has(id)) fail('INAPPLICABLE_MEMORY');
-        if (this.get('nodes', id).revision !== revision) fail('STALE_VERSION');
-        if (this.all('edges').some(e => e.data.from === projectId && e.data.to === id && e.data.kind === 'reuses_method')) continue;
-        const edgeId = randomUUID(); this.put('edges', edgeId, 'edge', { from: projectId, to: id, kind: 'reuses_method' });
-        links.push(edgeId);
-      }
-      return { projectId, memoryIds: versions.map(v => v.id), createdLinks: links.length };
     });
   }
 
@@ -381,7 +324,7 @@ export class MemoryStore {
     const row = this.db.prepare('SELECT * FROM changes WHERE id=?').get(id);
     if (!row) fail('CHANGE_NOT_FOUND');
     return { id, createdAt: row.created_at, expiresAt: row.expires_at, status: row.status,
-      summary: JSON.parse(row.summary), undoResult: row.undo_result ? JSON.parse(row.undo_result) : null };
+      summary: JSON.parse(row.summary) };
   }
 
   purgeExpired() {

@@ -38,13 +38,14 @@ export function openDirectory(input:string) {
   const file=join(root,'manifest.json');
   if(!existsSync(file)) {
     if(existsSync(join(root,'state.sqlite')))throw new Error('UNRECOGNIZED_DATA_DIRECTORY');
-    atomicJson(file,{format:'dsh-personal-assistant',schemaVersion:1,datasetId:randomUUID(),createdAt:new Date().toISOString()});
+    atomicJson(file,{format:'dsh-personal-assistant',schemaVersion:2,datasetId:randomUUID(),createdAt:new Date().toISOString()});
   }
   const manifest=JSON.parse(readFileSync(file,'utf8'));
-  if(manifest.format!=='dsh-personal-assistant'||manifest.schemaVersion!==1||typeof manifest.datasetId!=='string')throw new Error('UNSUPPORTED_DATA_FORMAT');
+  if(manifest.format==='dsh-personal-assistant'&&manifest.schemaVersion===1)throw Object.assign(new Error('MIGRATION_REQUIRED: run migrate-v2 --source <old-directory> --destination <new-directory>'),{code:'MIGRATION_REQUIRED'});
+  if(manifest.format!=='dsh-personal-assistant'||manifest.schemaVersion!==2||typeof manifest.datasetId!=='string')throw new Error('UNSUPPORTED_DATA_FORMAT');
   if(existsSync(join(root,'state.sqlite'))) {
     const check=new DatabaseSync(join(root,'state.sqlite'),{readOnly:true});
-    try { if(Number(check.prepare('PRAGMA user_version').get()?.user_version)>1)throw new Error('DATABASE_NEWER_THAN_PLUGIN'); } finally {check.close();}
+    try { const version=Number(check.prepare('PRAGMA user_version').get()?.user_version);if(version>2)throw new Error('DATABASE_NEWER_THAN_PLUGIN');if(version<2)throw Object.assign(new Error('MIGRATION_REQUIRED: run migrate-v2 before opening this database'),{code:'MIGRATION_REQUIRED'}); } finally {check.close();}
   }
   for(const name of ['runtime','credentials','content/blobs','projects','tools','conversations','exports','cache'])mkdirSync(inside(root,name),{recursive:true,mode:0o700});
   const lock=join(root,'runtime','writer.lock');

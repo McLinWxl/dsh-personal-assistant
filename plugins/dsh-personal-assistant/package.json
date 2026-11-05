@@ -1,6 +1,6 @@
 {
   "name": "dsh-personal-assistant",
-  "version": "0.1.0-alpha.8",
+  "version": "0.1.0-alpha.9",
   "private": false,
   "type": "module",
   "description": "Local personal memory, planning and task assistant for DeepSeek Harness",
@@ -28,6 +28,7 @@
     "lib/host.js",
     "lib/agent.js",
     "lib/worker.js",
+    "lib/migrate-v2.js",
     "lib/client.js",
     "lib/zones.json",
     "locale/en.json",
@@ -95,5 +96,8 @@
   },
   "dependencies": {
     "@napi-rs/keyring": "2.1.2"
+  },
+  "bin": {
+    "migrate-v2": "./lib/migrate-v2.js"
   }
 }

@@ -39,7 +39,7 @@ export function importCalendar(content:string,timezone:string){
   const actualTimezone=String(component.getFirstProperty('dtstart')?.getParameter('tzid')??timezone);
   items.push({uid,recurrenceId:component.getFirstPropertyValue('recurrence-id')?.toString()??'',ics:component.toString(),zones:[...zones],
    title:event.summary||'日程',start:start.isDate?start.toString():start.toJSDate().toISOString(),end:end.isDate?end.toString():end.toJSDate().toISOString(),timezone:actualTimezone,allDay:start.isDate,
-   recurrence:component.getFirstPropertyValue('rrule')?.toString()??'',location:event.location||'',description:event.description||'',projectId:null,taskId:null,domains:[],importance:3,
+   recurrence:component.getFirstPropertyValue('rrule')?.toString()??'',location:event.location||'',description:event.description||'',taskId:null,domains:[],importance:3,
    importHash:createHash('sha256').update(component.toString()).digest('hex')});if(items.length>500)throw new Error('ICS_TOO_MANY_EVENTS');
  }return items;
 }

@@ -6,6 +6,12 @@ import { openDirectory,inside,atomicJson } from './files.js';
 import { defaults,settingsSchema,validate,formattedDeadline,type Actor,type Settings } from '../domain/contracts.js';
 import { validateEvent,importCalendar,exportCalendar,calendarOccurrences,calendarIdentity,overrideOccurrence } from '../domain/calendar.js';
 import {Projects} from './projects.js';
+import {ProjectTree} from './project-tree.js';
+import {Capabilities} from './capabilities.js';
+import {createProjectSchema} from './schema-v2.js';
+import {commands, commandCatalog} from '../domain/commands.js';
+import {reject} from '../domain/errors.js';
+import type {ProjectData} from '../domain/project-types.js';
 const Base:any=MemoryStore;
 const fail=(code:string):never=>{throw new Error(code);};
 const clone=<T>(v:T):T=>structuredClone(v);
@@ -15,13 +21,15 @@ export class Store extends Base {
   directory:ReturnType<typeof openDirectory>;
   settings:Settings;
   projects:Projects;
+  tree:ProjectTree;
+  capabilities:Capabilities;
   constructor(path:string,options:any={}) {
     const directory=openDirectory(path);
     try {super(directory.root,{...options,codec:directory.codec});}catch(e){directory.release();throw e;}
     this.directory=directory;
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,role TEXT NOT NULL,text TEXT NOT NULL,at INTEGER NOT NULL,status TEXT NOT NULL,project_id TEXT);
+      CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,role TEXT NOT NULL,text TEXT NOT NULL,at INTEGER NOT NULL,status TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS source_retention ON sources(status,at);
       CREATE TABLE IF NOT EXISTS source_context(id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,workspace TEXT NOT NULL,preset TEXT NOT NULL,origin TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS notifications(id TEXT PRIMARY KEY,type TEXT NOT NULL,created_at INTEGER NOT NULL,read_at INTEGER,payload TEXT NOT NULL);
@@ -34,14 +42,17 @@ export class Store extends Base {
       CREATE TABLE IF NOT EXISTS channel_messages(id TEXT PRIMARY KEY,direction TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL,created_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,window_from INTEGER NOT NULL,window_to INTEGER NOT NULL,status TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 1,conversation_id TEXT,session_id TEXT,message_id TEXT,snapshot_id TEXT,body TEXT NOT NULL DEFAULT '',summary_json TEXT NOT NULL DEFAULT '{}',created_at INTEGER NOT NULL,confirmed_at INTEGER,pushed_at INTEGER);
       CREATE INDEX IF NOT EXISTS report_created ON reports(created_at);
-      CREATE TABLE IF NOT EXISTS report_items(id TEXT PRIMARY KEY,report_id TEXT NOT NULL,kind TEXT NOT NULL,object_id TEXT,action TEXT NOT NULL,title TEXT NOT NULL DEFAULT '',detail TEXT NOT NULL DEFAULT '',at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS report_items(id TEXT PRIMARY KEY,report_id TEXT NOT NULL,kind TEXT NOT NULL,object_id TEXT,action TEXT NOT NULL,title TEXT NOT NULL DEFAULT '',detail TEXT NOT NULL DEFAULT '',at INTEGER NOT NULL,metadata TEXT);
       CREATE INDEX IF NOT EXISTS report_item_report ON report_items(report_id,at);
       CREATE TABLE IF NOT EXISTS report_revisions(id TEXT PRIMARY KEY,report_id TEXT NOT NULL,revision INTEGER NOT NULL,body TEXT NOT NULL,created_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS report_revision_report ON report_revisions(report_id,revision);
       CREATE TABLE IF NOT EXISTS snapshots(id TEXT PRIMARY KEY,taken_at INTEGER NOT NULL,path TEXT NOT NULL,bytes INTEGER NOT NULL,sha256 TEXT NOT NULL,expires_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS node_kind ON nodes(kind);
-      PRAGMA user_version=1;
+      PRAGMA user_version=2;
     `);
+    createProjectSchema(this.db);
+    this.tree=new ProjectTree(this);
+    this.capabilities=new Capabilities(this);
     const saved=this.db.prepare("SELECT value FROM settings WHERE key='preferences'").get();
     this.settings=settingsSchema.parse({...defaults,...saved?JSON.parse(saved.value):{},...options.settings});
     this.retentionMs=this.settings.retentionHours*3600000;
@@ -50,6 +61,25 @@ export class Store extends Base {
   }
   close(){try{super.close();}finally{this.directory.release();}}
   owner(){return this.directory.manifest.datasetId;}
+  get(table:string,id:string){
+    const row=super.get(table,id);if(!row||table!=='nodes'||!this.tree)return row;
+    if(row.kind==='project'){
+      const data=this.tree.read(id,row.data.owner);if(!data)return null;
+      return{...row,data,projectId:null};
+    }
+    return{...row,projectId:this.tree.membership(id)};
+  }
+  put(table:string,id:string,kind:string,data:any,touched:string[]=[]){
+    if(table==='nodes'&&data&&Object.hasOwn(data,'projectId'))reject('STORED_PROJECT_FIELD_FORBIDDEN',{id,kind});
+    if(table==='nodes'&&kind==='project'&&data){
+      const result=super.put(table,id,kind,{owner:data.owner},[...Object.keys(data),...touched]);
+      this.tree.write(id,data as ProjectData);
+      return{...result,record:this.get(table,id)};
+    }
+    const result=super.put(table,id,kind,data,touched);
+    if(table==='nodes'&&this.tree)this.tree.touchProjects(this.tree.links(id).map(link=>link.projectId));
+    return result;
+  }
   node(id:string,kind?:string){const row=this.get('nodes',id);if(!row||row.data.owner!==this.owner()||(kind&&row.kind!==kind))fail('OBJECT_NOT_FOUND');if(row.kind==='task')row.data=this.taskData(row.data);return row;}
   rows(kind?:string){return this.db.prepare('SELECT id FROM nodes'+(kind?' WHERE kind=?':'')+' ORDER BY id').all(...(kind?[kind]:[])).map((r:any)=>this.node(r.id));}
   notify(type:string,payload:any,id:string=randomUUID()){
@@ -72,39 +102,46 @@ export class Store extends Base {
     if(!input.id||!input.sessionId||!['user','assistant','tool'].includes(input.role)||input.text.length>200000)fail('INVALID_SOURCE');
     const existing=this.db.prepare('SELECT text FROM sources WHERE id=?').get(input.id);
     if(existing){if(existing.text!==input.text)fail('SOURCE_ID_REUSED');this.projects.enqueue(input);return{id:input.id};}
-    this.db.prepare('INSERT INTO sources VALUES(?,?,?,?,?,?,?)').run(input.id,input.sessionId,input.role,input.text,input.at??this.now(),input.status??'pending',input.projectId??null);if(input.context)this.db.prepare('INSERT OR IGNORE INTO source_context VALUES(?,?,?,?)').run(input.id,input.context.workspace,input.context.preset,input.context.origin);this.projects.enqueue(input);return{id:input.id};
+    this.db.prepare('INSERT INTO sources VALUES(?,?,?,?,?,?)').run(input.id,input.sessionId,input.role,input.text,input.at??this.now(),input.status??'pending');if(input.context)this.db.prepare('INSERT OR IGNORE INTO source_context VALUES(?,?,?,?)').run(input.id,input.context.workspace,input.context.preset,input.context.origin);this.projects.enqueue(input);return{id:input.id};
   }
   dispatch(command:string,input:unknown,key:string,actor:Actor){
-    const a:any=validate(command,input);const reads=new Set(['overview','list','get','settingsGet','memorySearch','related','relations','calendar','icsExport','changes','change','inbox','toolVersions','reportWindow','reportList','reportGet']);
-    // VACUUM INTO cannot run inside a transaction, so snapshots bypass the command wrapper.
-    const direct=reads.has(command)||command==='snapshotTake';
-    const result=direct?this.execute(command,a,key,actor):this.command(key,{command,a,actor:actor.kind},()=>this.execute(command,a,key+':body',actor));
-    if(command==='settingsSave'){this.settings=settingsSchema.parse(JSON.parse(this.db.prepare("SELECT value FROM settings WHERE key='preferences'").get().value));this.retentionMs=this.settings.retentionHours*3600000;}return result;
+    try{
+      const a:any=validate(command,input),definition=commands[command as keyof typeof commands];
+      if(!definition.actors.includes(actor.kind))reject('OWNER_ACTION_REQUIRED');
+      const execute=()=>{const result=this.execute(command,a,key+':body',actor);this.tree.assertIntegrity();return result;};
+      const result=definition.read||command==='snapshotTake'?this.execute(command,a,key,actor):this.command(key,{command,a,actor:actor.kind},execute);
+      if(command==='settingsSave'){this.settings=settingsSchema.parse(JSON.parse(this.db.prepare("SELECT value FROM settings WHERE key='preferences'").get().value));this.retentionMs=this.settings.retentionHours*3600000;}
+      if(['model','maintenance'].includes(actor.kind))this.command('usage:'+key,{command,outcome:'succeeded'},()=>{this.capabilities.observe(key,'assistant_'+command,actor,input);return{saved:true};});
+      return result;
+    }catch(error:any){
+      if(['model','maintenance'].includes(actor.kind))this.command('failure:'+key,{command,code:error.code??error.message},()=>{this.capabilities.observe(key,'assistant_'+command,actor,input,error);return{saved:true};});
+      throw error;
+    }
   }
   execute(command:string,a:any,key:string,actor:Actor){
-    const uiOnly=['settingsSave','remove','toolActivate','inboxRead'];
-    if(uiOnly.includes(command)&&actor.kind!=='ui'&&actor.kind!=='system')fail('OWNER_ACTION_REQUIRED');
+    if(this.tree.isOperation(command))return this.tree.execute(command,a,actor);
     switch(command){
       case'overview':return{counts:Object.fromEntries(this.db.prepare('SELECT kind,COUNT(*) AS n FROM nodes GROUP BY kind').all().map((r:any)=>[r.kind,r.n])),unread:Number(this.db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE read_at IS NULL').get().n),dataRoot:this.directory.root,settings:this.settings};
       case'list':return this.list(a);
       case'searchAll':return this.searchAll(a);
       case'get':return this.node(a.id);
-      case'relations':this.node(a.id);return this.all('edges').filter((e:any)=>e.data.from===a.id||e.data.to===a.id).map((e:any)=>({id:e.id,kind:e.data.kind,direction:e.data.from===a.id?'out':'in',object:this.node(e.data.from===a.id?e.data.to:e.data.from)}));
+      case'relations':{const object=this.node(a.id);return[...this.all('edges').filter((e:any)=>e.data.from===a.id||e.data.to===a.id).map((e:any)=>({id:e.id,kind:e.data.kind,direction:e.data.from===a.id?'out':'in',object:this.node(e.data.from===a.id?e.data.to:e.data.from)})),...this.tree.links(object.kind==='project'?undefined:a.id,object.kind==='project'?a.id:undefined).map(link=>({id:link.objectId+':'+link.projectId+':'+link.role,kind:link.role,direction:object.kind==='project'?'out':'in',object:this.node(object.kind==='project'?link.objectId:link.projectId)}))];}
       case'settingsGet':return this.settings;
       case'settingsSave':return this.command(key,{command,a},()=>{const next=settingsSchema.parse({...this.settings,...a});this.db.prepare('INSERT OR REPLACE INTO settings VALUES(?,?)').run('preferences',JSON.stringify(next));return{saved:true};});
-      case'projectCreate':if(['model','maintenance'].includes(actor.kind))fail('USE_PROJECT_RESOLVE');return this.create('project',a,key);
-      case'projectEdit':return this.edit(a.id,'project',a.patch,a.revision,key);
+      case'projectTree':return this.tree.tree(a.rootId,a.includeArchived);
+      case'projectPreview':return this.tree.preview(a,actor);
+      case'projectBinding':{if(a.sessionId&&actor.kind==='model'&&a.sessionId!==actor.sessionId)reject('SOURCE_SESSION_MISMATCH');const sessionId=a.sessionId??actor.sessionId;if(!sessionId)reject('SESSION_REQUIRED');return this.tree.binding(sessionId);}
+      case'projectDecisions':return this.projects.decisions(a.status,a.limit);
+      case'capabilityGapReport':return this.capabilities.report(a,key);
+      case'capabilityGaps':return this.capabilities.list(a.status,a.limit);
+      case'capabilityGapUpdate':return this.capabilities.update(a);
+      case'capabilityProposal':return this.capabilities.propose(a);
+      case'capabilityCatalog':return commandCatalog();
       case'memoryCapture':return this.capture(a,key,actor);
-      case'memoryEdit':{const extra:any[]=[];
-        if(Object.hasOwn(a.patch,'projectId')){const projectId=a.patch.projectId||null;if(projectId)this.node(projectId,'project');
-          const links=this.all('edges').filter((e:any)=>e.data.to===a.id&&e.data.kind==='belongs_to');
-          for(const edge of links)if(edge.data.from!==projectId)extra.push({id:edge.id,table:'edges',before:edge,data:null});
-          if(projectId&&!links.some((e:any)=>e.data.from===projectId))extra.push({id:randomUUID(),table:'edges',kind:'edge',data:{from:projectId,to:a.id,kind:'belongs_to'}});
-          a.patch.projectId=projectId;}
-        return this.edit(a.id,'memory',a.patch,a.revision,key,true,extra);}
+      case'memoryEdit':return this.edit(a.id,'memory',a.patch,a.revision,key,true);
       case'memoryRefresh':{const row=this.node(a.id,'memory');if(!row.data.derivedDirty)fail('MEMORY_ALREADY_CURRENT');return this.edit(a.id,'memory',{facts:a.facts,canonicalFacts:a.facts,derivedDirty:false,domains:row.data.manualFields?.includes('domains')?row.data.domains:a.domains,topics:row.data.manualFields?.includes('topics')?row.data.topics:a.topics},a.revision,key);}
       case'memoryClassify':{const row=this.node(a.id,'memory');const patch:any={};for(const field of ['domains','topics','reusable'])if(a[field]!==undefined&&!row.data.manualFields?.includes(field)){patch[field]=field==='reusable'?a[field]&&['method','fact'].includes(row.data.type):a[field];}return this.edit(a.id,'memory',patch,a.revision,key);}
-      case'memoryPrune':{const row=this.node(a.id,'memory'),d=row.data;const last=Math.max(d.createdAt??0,...d.observations.map((o:any)=>Date.parse(o.at)));if(d.pinned||d.protected||d.manualFields?.length||d.notes||d.importance>2||!['fact','method'].includes(d.type)||last>this.now()-365*86400000||this.all('edges').some((e:any)=>e.data.from===a.id||e.data.to===a.id))fail('MEMORY_REQUIRES_RETENTION');if(a.reason==='expired'&&(!d.validTo||Date.parse(d.validTo)>this.now()))fail('MEMORY_NOT_EXPIRED');return this.remove(a.id,a.revision,key);}
+      case'memoryPrune':{const row=this.node(a.id,'memory'),d=row.data;const last=Math.max(d.createdAt??0,...d.observations.map((o:any)=>Date.parse(o.at)));if(d.pinned||d.protected||d.manualFields?.length||d.notes||d.importance>2||!['fact','method'].includes(d.type)||last>this.now()-365*86400000||this.tree.links(a.id).length||this.all('edges').some((e:any)=>e.data.from===a.id||e.data.to===a.id))fail('MEMORY_REQUIRES_RETENTION');if(a.reason==='expired'&&(!d.validTo||Date.parse(d.validTo)>this.now()))fail('MEMORY_NOT_EXPIRED');return this.remove(a.id,a.revision,key);}
       case'memorySearch':return this.search(a);
       case'related':this.node(a.projectId,'project');return this.findRelated(a.projectId);
       case'associate':this.node(a.projectId,'project');return this.associateSelected(a.projectId,a.memories,key);
@@ -140,18 +177,26 @@ export class Store extends Base {
         const rows=this.db.prepare('SELECT r.*,(SELECT COUNT(*) FROM report_items i WHERE i.report_id=r.id) AS item_count FROM reports r ORDER BY r.created_at DESC,r.id DESC LIMIT ? OFFSET ?').all(a.limit,a.offset);
         return{items:rows.map((r:any)=>this.reportRow(r,false,r.item_count)),total,offset:a.offset};}
       case'reportGet':{const row=this.db.prepare('SELECT * FROM reports WHERE id=?').get(a.id);if(!row)fail('REPORT_NOT_FOUND');
-        const items=this.db.prepare('SELECT * FROM report_items WHERE report_id=? ORDER BY at,id').all(a.id).map((i:any)=>({id:i.id,kind:i.kind,objectId:i.object_id,action:i.action,title:i.title,detail:i.detail,at:Number(i.at)}));
+        const items=this.db.prepare('SELECT * FROM report_items WHERE report_id=? ORDER BY at,id').all(a.id).map((i:any)=>({id:i.id,kind:i.kind,objectId:i.object_id,action:i.action,title:i.title,detail:i.detail,at:Number(i.at),metadata:json(i.metadata)}));
         const revisions=this.db.prepare('SELECT revision,body,created_at FROM report_revisions WHERE report_id=? ORDER BY revision').all(a.id).map((r:any)=>({revision:Number(r.revision),body:r.body,createdAt:Number(r.created_at)}));
         return{...this.reportRow(row,true,items.length),items,revisions};}
       case'snapshotTake':return this.snapshotTake();
       case'snapshotPrune':return this.snapshotPrune(a.days);
       case'remove':return this.remove(a.id,a.revision,key);
-      case'projectRemove':{this.node(a.id,'project');return this.remove(a.id,a.revision,key);}
       case'memoryRemove':if(actor.kind==='maintenance')fail('MAINTENANCE_COMMAND_NOT_ALLOWED');this.node(a.id,'memory');return this.remove(a.id,a.revision,key);
       case'taskCreate':this.taskReferences(a);return this.create('task',this.taskData(a),key);
       case'taskEdit':{const row=this.node(a.id,'task');this.taskReferences({...row.data,...a.patch},a.id);if(actor.kind==='model'&&a.patch.status==='completed')fail('TASK_COMPLETION_REQUIRES_RUN_RESULT');return this.edit(a.id,'task',this.taskData({...row.data,...a.patch}),a.revision,key);}
       case'eventCreate':this.eventReferences(a);validateEvent(a);return this.create('event',a,key);
-      case'eventOverride':return this.command(key,{command,a},()=>{const selected=this.node(a.id,'event');const master=selected.data.recurrenceId?this.rows('event').find((r:any)=>r.data.uid===selected.data.uid&&!r.data.recurrenceId):selected;if(!master)fail('RECURRING_EVENT_REQUIRED');if(selected.revision!==a.revision)fail('STALE_VERSION');const data=overrideOccurrence(master.data,a.occurrence,a.patch,a.cancelled);const old=this.rows('event').find((r:any)=>r.data.uid===data.uid&&r.data.recurrenceId===data.recurrenceId);if(old&&old.id!==a.id)fail('STALE_VERSION');return this.journal('calendar.occurrence.updated',[{id:old?.id??randomUUID(),kind:'event',before:old,data:{...data,owner:this.owner()}}]);});
+      case'eventOverride':return this.command(key,{command,a},()=>{
+        const selected=this.node(a.id,'event'),master=selected.data.recurrenceId?this.rows('event').find((row:any)=>row.data.uid===selected.data.uid&&!row.data.recurrenceId):selected;
+        if(!master)fail('RECURRING_EVENT_REQUIRED');if(selected.revision!==a.revision)fail('STALE_VERSION');
+        const {projectId,...patch}=a.patch,data=overrideOccurrence(master.data,a.occurrence,patch,a.cancelled);
+        const old=this.rows('event').find((row:any)=>row.data.uid===data.uid&&row.data.recurrenceId===data.recurrenceId);
+        if(old&&old.id!==a.id)fail('STALE_VERSION');
+        const id=old?.id??randomUUID(),result=this.journal('calendar.occurrence.updated',[{id,kind:'event',before:old,data:{...data,owner:this.owner()}}]);
+        this.setMembership(id,Object.hasOwn(a.patch,'projectId')?projectId:old?.projectId??master.projectId);
+        return{id,revision:this.node(id).revision,...result};
+      });
       case'eventEdit':{const row=this.node(a.id,'event');if(row.data.ics&&(row.data.recurrenceId||row.data.recurrence||/EXDATE|RDATE/.test(row.data.ics)))fail('EDIT_IMPORTED_SERIES_VIA_OCCURRENCE');const next={...row.data,...a.patch,ics:undefined,zones:undefined,importHash:undefined};this.eventReferences(next);validateEvent(next);return this.edit(a.id,'event',next,a.revision,key);}
       case'calendar':return calendarOccurrences(this.rows('event'),a.from,a.to);
       case'icsImport':return this.importIcs(a,key);
@@ -171,18 +216,34 @@ export class Store extends Base {
     const to=this.now();
     let from:number;
     if(a.from!==undefined)from=Number(a.from);
-    else{const last:any=this.db.prepare("SELECT COALESCE(confirmed_at,window_to) AS anchor FROM reports ORDER BY created_at DESC,id DESC LIMIT 1").get();from=last?Number(last.anchor):to-86400000;}
+    else{const last:any=this.db.prepare("SELECT window_to AS anchor FROM reports ORDER BY created_at DESC,id DESC LIMIT 1").get();from=last?Number(last.anchor):to-86400000;}
     const items:any[]=[];
     const number=(value:any)=>{const n=Number(value);return Number.isFinite(n)?n:null;};
-    const nodeRows=this.db.prepare("SELECT id FROM nodes WHERE kind IN ('memory','project','task','event','tool') AND (COALESCE(json_extract(data,'$.createdAt'),-1)>=? AND COALESCE(json_extract(data,'$.createdAt'),-1)<? OR COALESCE(json_extract(data,'$.updatedAt'),-1)>=? AND COALESCE(json_extract(data,'$.updatedAt'),-1)<?)").all(from,to,from,to);
+    const nodeRows=this.db.prepare("SELECT id FROM nodes WHERE kind IN ('memory','task','event','tool') AND (COALESCE(json_extract(data,'$.createdAt'),-1)>=? AND COALESCE(json_extract(data,'$.createdAt'),-1)<? OR COALESCE(json_extract(data,'$.updatedAt'),-1)>=? AND COALESCE(json_extract(data,'$.updatedAt'),-1)<?)").all(from,to,from,to);
     for(const entry of nodeRows){
       const data=this.node(entry.id).data,created=number(data.createdAt),updated=number(data.updatedAt);
       const createdIn=created!==null&&created>=from&&created<to,updatedIn=updated!==null&&updated>=from&&updated<to;
       if(!createdIn&&!updatedIn)continue;
-      items.push({kind:this.get('nodes',entry.id).kind,objectId:entry.id,action:createdIn?'created':'updated',title:String(data.title??''),detail:String(data.body??data.goal??data.description??'').slice(0,160),at:createdIn?created:updated});
+      items.push({kind:this.get('nodes',entry.id).kind,objectId:entry.id,action:createdIn?'created':'updated',title:String(data.title??''),detail:String(data.body??data.statement??data.description??'').slice(0,160),at:createdIn?created:updated});
     }
-    for(const row of this.db.prepare('SELECT * FROM changes WHERE created_at>=? AND created_at<?').all(from,to)){
+    for(const change of this.tree.history(from,to))items.push({kind:['attached','detached','bound'].includes(change.action)?'relation':'project',objectId:change.objectId,action:change.action,title:change.title,detail:change.reason,at:change.at,metadata:{treeDiff:change}});
+    for(const decision of this.projects.decisions(undefined,100,{from,to}).filter(row=>row.status!=='applied'))items.push({kind:'maintenance',objectId:decision.subject_id,action:decision.status,title:decision.title,detail:decision.reason,at:decision.updated_at});
+    for(const gap of this.capabilities.list(undefined,100,{from,to}))items.push({kind:'capability',objectId:gap.id,action:gap.status,title:gap.target,detail:gap.context,at:gap.last_seen_at,metadata:{gap}});
+    for(const row of this.db.prepare('SELECT * FROM changes WHERE created_at>=? AND created_at<? ORDER BY created_at DESC,(SELECT MAX(after_revision) FROM deltas WHERE change_id=changes.id) DESC').all(from,to)){
+      if(String(json(row.summary)?.type??'').startsWith('project.'))continue;
       const summary:any=json(row.summary)??{},type=String(summary.type??''),changed=Number(summary.changedObjects??this.db.prepare('SELECT COUNT(*) AS n FROM deltas WHERE change_id=?').get(row.id).n);
+      if (!summary.groups && /^(memory|task|event|tool)\./.test(type)) {
+        const deltas = this.db.prepare("SELECT object_id,before_json,after_json FROM deltas WHERE change_id=? AND table_name='nodes'").all(row.id);
+        for (const delta of deltas) {
+          const before = delta.before_json ? json(this.codec.open(delta.before_json)) : null;
+          const after = delta.after_json ? json(this.codec.open(delta.after_json)) : null;
+          const object = after ?? before;
+          if (!object || items.some(item => item.kind === object.kind && item.objectId === delta.object_id)) continue;
+          items.push({kind:object.kind,objectId:delta.object_id,action:after ? before ? 'updated' : 'created' : 'removed',
+            title:String(object.data?.title ?? ''),detail:'',at:Number(row.created_at)});
+        }
+        continue;
+      }
       items.push({kind:'maintenance',objectId:row.id,action:/merge|consolidat|maintain/.test(type)||summary.groups?'merged':'updated',title:String(summary.title??(summary.groups?'记忆归并':type||'整理记录')),detail:`影响 ${changed} 项`,at:Number(row.created_at)});
     }
     for(const row of this.db.prepare('SELECT * FROM runs WHERE (created_at>=? AND created_at<?) OR (updated_at>=? AND updated_at<?)').all(from,to,from,to)){
@@ -201,7 +262,7 @@ export class Store extends Base {
       items.push({kind,objectId:row.id,action:/failed|unknown|error/.test(type)?'failed':'confirmed',title:String(payload.title??labels[type]??type),detail:detail.slice(0,160),at:Number(row.created_at)});
     }
     items.sort((x:any,y:any)=>x.at-y.at||String(x.objectId).localeCompare(String(y.objectId)));
-    const capped=items.length>400?items.slice(-400):items;
+    const capped=items;
     const summary:any={memories:0,projects:0,tasks:0,events:0,tools:0,runs:0,wechat:0,maintenance:0};
     const buckets:Record<string,string>={memory:'memories',project:'projects',task:'tasks',event:'events',tool:'tools',run:'runs',wechat:'wechat',maintenance:'maintenance'};
     for(const item of capped){const key=buckets[item.kind];if(key)summary[key]++;}
@@ -212,7 +273,7 @@ export class Store extends Base {
   }
   insertReportItem(reportId:string,item:any,fallbackAt:number){
     const at=Number(item?.at),ts=Number.isFinite(at)?Math.trunc(at):fallbackAt;
-    this.db.prepare('INSERT INTO report_items VALUES(?,?,?,?,?,?,?,?)').run(randomUUID(),reportId,String(item?.kind??'maintenance'),item?.objectId??item?.object_id??null,String(item?.action??'updated'),String(item?.title??''),String(item?.detail??'').slice(0,1000),ts);
+    this.db.prepare('INSERT INTO report_items VALUES(?,?,?,?,?,?,?,?,?)').run(randomUUID(),reportId,String(item?.kind??'maintenance'),item?.objectId??item?.object_id??null,String(item?.action??'updated'),String(item?.title??''),String(item?.detail??'').slice(0,1000),ts,item?.metadata?JSON.stringify(item.metadata):null);
   }
   snapshotTake(){
     const now=this.now(),directory=join(this.directory.root,'snapshots'),stamp=this.snapshotStamp(now);
@@ -243,26 +304,45 @@ export class Store extends Base {
     return{removed:remove.length};
   }
   list(a:any){
-    let sql='SELECT id FROM nodes WHERE kind=?';const params:any[]=[a.kind];
-    if(a.query){sql+=" AND (json_extract(data,'$.title') LIKE ? ESCAPE '\\' OR json_extract(data,'$.body') LIKE ? ESCAPE '\\')";const q='%'+a.query.replace(/[\\%_]/g,(s:string)=>'\\'+s)+'%';params.push(q,q);}
-    if(a.projectId){this.node(a.projectId,'project');sql+=' AND (id IN (SELECT to_id FROM edges WHERE from_id=?) OR json_extract(data,\'$.projectId\')=?)';params.push(a.projectId,a.projectId);}
-    const total=Number(this.db.prepare(sql.replace('SELECT id','SELECT COUNT(*) AS n')).get(...params).n);
-    const order=a.sort==='title'?"json_extract(data,'$.title') COLLATE NOCASE ASC,id":a.sort==='created'?"COALESCE(json_extract(data,'$.createdAt'),0) DESC,id":"COALESCE(CASE WHEN kind='memory' THEN json_extract(data,'$.observations[#-1].at') END,json_extract(data,'$.createdAt'),0) DESC,id";
-    const rows=this.db.prepare(sql+' ORDER BY '+order+' LIMIT ? OFFSET ?').all(...params,a.limit,a.offset).map((r:any)=>this.node(r.id));return{items:rows,total,offset:a.offset};
+    let rows=this.rows(a.kind).filter((row:any)=>!row.data.mergedInto);
+    if(a.query){const query=String(a.query).normalize('NFKC').toLowerCase();rows=rows.filter((row:any)=>[row.data.title,row.data.body,row.data.statement].some(value=>String(value??'').normalize('NFKC').toLowerCase().includes(query)));}
+    if(a.projectId){this.tree.node(a.projectId);const members=new Set(this.tree.links(undefined,a.projectId).map(link=>link.objectId));rows=rows.filter((row:any)=>members.has(row.id));}
+    const activity=(row:any)=>a.sort==='created'?Number(row.data.createdAt??0):row.kind==='memory'?Math.max(Number(row.data.updatedAt??0),Date.parse(row.data.observations?.at(-1)?.at??'')||Number(row.data.createdAt??0)):Number(row.data.updatedAt??row.data.createdAt??0);
+    rows.sort((aRow:any,bRow:any)=>a.sort==='title'?String(aRow.data.title??'').localeCompare(String(bRow.data.title??''))||aRow.id.localeCompare(bRow.id):activity(bRow)-activity(aRow)||aRow.id.localeCompare(bRow.id));
+    return{items:rows.slice(a.offset,a.offset+a.limit),total:rows.length,offset:a.offset};
   }
   searchAll(a:any){
-    const raw=String(a.query??'').trim();if(!raw)return{query:'',groups:{},total:0};
-    const like='%'+raw.replace(/[\\%_]/g,(s:string)=>'\\'+s)+'%',limit=Math.max(1,Math.min(50,a.limit??20));
-    const rows:any[]=this.db.prepare("SELECT kind,id,json_extract(data,'$.title') AS title,json_extract(data,'$.name') AS name,json_extract(data,'$.body') AS body,json_extract(data,'$.goal') AS goal,json_extract(data,'$.description') AS description,COALESCE(json_extract(data,'$.createdAt'),0) AS createdAt FROM nodes WHERE kind IN ('memory','project','task','event','tool','entity') AND (json_extract(data,'$.title') LIKE ? ESCAPE '\\' OR json_extract(data,'$.name') LIKE ? ESCAPE '\\' OR json_extract(data,'$.body') LIKE ? ESCAPE '\\' OR json_extract(data,'$.goal') LIKE ? ESCAPE '\\' OR json_extract(data,'$.description') LIKE ? ESCAPE '\\') ORDER BY createdAt DESC LIMIT ?").all(like,like,like,like,like,limit*4);
-    const groups:Record<string,any[]>={};let total=0;
-    for(const row of rows){const bucket=groups[row.kind]??(groups[row.kind]=[]);if(bucket.length>=5)continue;bucket.push({id:row.id,kind:row.kind,title:row.title??row.name??'',snippet:String(row.body??row.goal??row.description??'').slice(0,120)});total++;}
-    return{query:raw,groups,total};
+    const query=String(a.query).normalize('NFKC').toLowerCase(),groups:Record<string,any[]>={};let total=0;
+    for(const row of this.rows()){
+      if(row.data.mergedInto||![row.data.title,row.data.name,row.data.body,row.data.statement,row.data.description].some(value=>String(value??'').normalize('NFKC').toLowerCase().includes(query)))continue;
+      const bucket=groups[row.kind]??(groups[row.kind]=[]);if(bucket.length>=Math.min(a.limit,5))continue;
+      bucket.push({id:row.id,kind:row.kind,title:row.data.title??row.data.name??'',snippet:String(row.data.body??row.data.statement??row.data.description??'').slice(0,120)});total++;
+    }
+    return{query:a.query,groups,total};
   }
-  create(kind:string,data:any,key:string){return this.command(key,{action:'create',kind,data},()=>{const id=randomUUID();const change=this.journal(kind+'.created',[{id,kind,data:{...clone(data),owner:this.owner(),...(kind==='event'?{uid:randomUUID()}:{}),createdAt:data.createdAt??this.now()}}]);return{id,revision:this.version('nodes',id),...change};});}
-  edit(id:string,kind:string,patch:any,revision:number,key:string,manual=false,extra:any[]=[]){return this.command(key,{action:'edit',id,kind,patch,revision},()=>{
+  setMembership(id:string,projectId:string|null,actor:Actor={kind:'system'}){
+    const previous=this.tree.membership(id),object=this.node(id);
+    if(previous===projectId)return{unchanged:true};
+    if(projectId){const project=this.tree.node(projectId);return this.tree.attach({object:{id,revision:object.revision},project:{id:projectId,revision:project.revision},role:'contains',reason:'设置所属项目',confidence:1},actor);}
+    if(previous){const project=this.tree.node(previous);return this.tree.attach({object:{id,revision:object.revision},project:{id:previous,revision:project.revision},role:'contains',reason:'解除所属项目',confidence:1},actor,true);}
+    return{unchanged:true};
+  }
+  create(kind:string,input:any,key:string){return this.command(key,{action:'create',kind,input},()=>{
+    if(kind==='project')reject('USE_PROJECT_COMMAND');
+    const {projectId,...data}=input,id=randomUUID();const change=this.journal(kind+'.created',[{id,kind,data:{...clone(data),owner:this.owner(),...(kind==='event'?{uid:randomUUID()}:{}),createdAt:data.createdAt??this.now()}}]);
+    if(projectId)this.setMembership(id,projectId);
+    return{id,revision:this.version('nodes',id),...change};
+  });}
+  edit(id:string,kind:string,input:any,revision:number,key:string,manual=false,extra:any[]=[]){return this.command(key,{action:'edit',id,kind,input,revision},()=>{
+    if(kind==='project')reject('USE_PROJECT_COMMAND');
     const before=this.node(id,kind);if(before.revision!==revision)fail('STALE_VERSION');
-    if(!manual&&Object.entries(patch).every(([k,v])=>JSON.stringify(before.data[k])===JSON.stringify(v)))return{id,revision:before.revision,unchanged:true};const data={...before.data,...patch};if(manual){data.manualFields=[...new Set([...(data.manualFields??[]),...Object.keys(patch)])];if('body'in patch){data.derivedDirty=true;data.canonicalFacts=[];}}
-    const change=this.journal(kind+'.updated',[{id,before,data,touched:Object.keys(patch)},...extra]);return{id,revision:this.version('nodes',id),...change};});}
+    const {projectId,...patch}=input,changesMembership=Object.hasOwn(input,'projectId');
+    if(!manual&&Object.entries(patch).every(([k,v])=>JSON.stringify(before.data[k])===JSON.stringify(v))&&(!changesMembership||projectId===before.projectId))return{id,revision:before.revision,unchanged:true};
+    const data={...before.data,...patch,updatedAt:this.now()};if(manual){data.manualFields=[...new Set([...(data.manualFields??[]),...Object.keys(patch)])];if('body'in patch){data.derivedDirty=true;data.canonicalFacts=[];}}
+    const change=this.journal(kind+'.updated',[{id,before,data,touched:Object.keys(patch)},...extra]);
+    if(changesMembership)this.setMembership(id,projectId??null);
+    return{id,revision:this.version('nodes',id),...change};
+  });}
   capture(a:any,key:string,actor:Actor){return this.command(key,{action:'capture',a},()=>{
     if(['model','maintenance'].includes(actor.kind)&&actor.sourceId!==a.sourceId&&!actor.allowedSourceIds?.includes(a.sourceId))fail('SOURCE_NOT_IN_CURRENT_TURN');
     const source=this.db.prepare('SELECT * FROM sources WHERE id=?').get(a.sourceId);if(actor.sessionId&&source?.session_id!==actor.sessionId)fail('SOURCE_SESSION_MISMATCH');if(!source||!source.text.includes(a.quote))fail('QUOTE_NOT_IN_SOURCE');
@@ -274,8 +354,7 @@ export class Store extends Base {
       observations:[{sourceId,quote,at:occurredAt,recordedAt:new Date(this.now()).toISOString()}],
       originalClaims:[{sourceId,quote,body:a.body,facts:a.facts,at:occurredAt}],canonicalFacts:a.facts};
     const mutations:any[]=[{id,kind:'memory',data}];
-    if(projectId)mutations.push({table:'edges',id:randomUUID(),kind:'edge',data:{from:projectId,to:id,kind:'belongs_to'}});
-    const change=this.journal('memory.created',mutations);this.db.prepare("UPDATE sources SET status='captured' WHERE id=?").run(sourceId);
+    const change=this.journal('memory.created',mutations);if(projectId)this.setMembership(id,projectId,actor);this.db.prepare("UPDATE sources SET status='captured' WHERE id=?").run(sourceId);
     return{id,revision:this.version('nodes',id),...change};
   });}
   search(a:any){
@@ -291,16 +370,16 @@ export class Store extends Base {
       return [{...common,...a.purpose==='personal'?{facts:d.derivedDirty?[]:d.facts,originalClaims:d.manualFields?.includes('body')?[]:d.originalClaims,observations:d.observations}:{body:d.body.slice(0,600)}}];
     }).slice(0,a.limit);
   }
-  findRelated(projectId:string){const p=this.node(projectId,'project');return this.search({query:[p.data.title,p.data.goal,...p.data.topics].join(' '),projectId,purpose:'personal',limit:30}).filter((r:any)=>r.reusable&&!r.derivedDirty).slice(0,12);}
+  findRelated(projectId:string){const p=this.node(projectId,'project');return this.search({query:[p.data.title,p.data.statement,...p.data.topics].join(' '),projectId,purpose:'personal',limit:30}).filter((r:any)=>r.reusable&&!r.derivedDirty).slice(0,12);}
   consolidationEligible(memory:any,reviews:any[]=[]){return memory.data.reusable&&!memory.data.derivedDirty&&super.consolidationEligible(memory,reviews);}
   taskData(a:any){const due=a.dueAt?Date.parse(a.dueAt):null;return{...a,urgent:due!==null&&due-this.now()<=48*3600000,important:a.importance>=4};}
   taskReferences(a:any,self?:string){if(a.projectId)this.node(a.projectId,'project');for(const dependency of a.dependsOn){this.node(dependency,'task');const seen=new Set([self]);const visit=(id:string)=>{if(seen.has(id))fail('TASK_DEPENDENCY_CYCLE');seen.add(id);for(const next of this.node(id,'task').data.dependsOn??[])visit(next);seen.delete(id);};visit(dependency);}}
   eventReferences(a:any){if(a.projectId)this.node(a.projectId,'project');if(a.taskId)this.node(a.taskId,'task');}
   remove(id:string,revision:number,key:string){return this.command(key,{action:'remove',id,revision},()=>{const before=this.node(id);if(before.revision!==revision)fail('STALE_VERSION');
-    if(before.kind==='project'&&this.rows().some((r:any)=>r.data.projectId===id))fail('PROJECT_HAS_ACTIVE_REFERENCES');
+    if(before.kind==='project')return this.tree.remove({id,revision,reason:'删除项目',confidence:1});
     if(before.kind==='task'&&(this.rows('task').some((r:any)=>(r.data.dependsOn??[]).includes(id))||this.rows('event').some((r:any)=>r.data.taskId===id)))fail('TASK_HAS_DEPENDENTS');
     const edges=this.all('edges').filter((r:any)=>r.data.from===id||r.data.to===id);
-    const exceptions=before.kind==='event'&&!before.data.recurrenceId?this.rows('event').filter((r:any)=>r.data.uid===before.data.uid&&r.id!==id):[];return this.journal(before.kind+'.removed',[...exceptions.map((r:any)=>({id:r.id,before:r,data:null})),...edges.map((e:any)=>({id:e.id,table:'edges',before:e,data:null})),{id,before,data:null}]);});}
+    const exceptions=before.kind==='event'&&!before.data.recurrenceId?this.rows('event').filter((r:any)=>r.data.uid===before.data.uid&&r.id!==id):[];for(const object of [before,...exceptions]){this.tree.touchProjects(this.tree.links(object.id).map(link=>link.projectId));this.db.prepare('DELETE FROM links WHERE object_id=?').run(object.id);}return this.journal(before.kind+'.removed',[...exceptions.map((r:any)=>({id:r.id,before:r,data:null})),...edges.map((e:any)=>({id:e.id,table:'edges',before:e,data:null})),{id,before,data:null}]);});}
   importIcs(a:any,key:string){const items=importCalendar(a.content,a.timezone);return this.command(key,{action:'import-ics',hash:digest(a.content)},()=>{
     const mutations:any[]=[];let unchanged=0;
     for(const data of items){const old=this.rows('event').find((r:any)=>r.data.uid===data.uid&&(r.data.recurrenceId??'')===data.recurrenceId);
@@ -313,6 +392,7 @@ export class Store extends Base {
   saveTool(a:any,key:string,actor:Actor){return this.command(key,{action:'tool-save',a},()=>{
     const before=a.id?this.node(a.id,'tool'):null;if(before&&before.revision!==a.revision)fail('STALE_VERSION');
     const id=before?.id??randomUUID(),version=createHash('sha256').update(JSON.stringify(a.definition)).digest('hex');
+    if(!before&&actor.kind!=='ui'){const existing=this.db.prepare('SELECT tool_id FROM tool_versions WHERE id=? LIMIT 1').get(version);if(existing){const tool=this.node(existing.tool_id,'tool');return{id:tool.id,version,status:tool.data.status,revision:tool.revision,unchanged:true};}}
     if(before&&(before.data.pendingVersion??before.data.activeVersion)===version)return{id,version,status:before.data.status,revision:before.revision,unchanged:true};
     if(a.definition.kind==='workflow'&&!a.definition.steps.length)fail('WORKFLOW_STEPS_REQUIRED');
     if(a.definition.kind==='script'&&!a.definition.source.trim())fail('SCRIPT_SOURCE_REQUIRED');
@@ -320,20 +400,31 @@ export class Store extends Base {
     const changedCaps=before&&a.definition.capabilities.some((c:string)=>!before.data.capabilities.includes(c));
     const active=actor.kind==='ui';
     const data={...a.definition,owner:this.owner(),createdAt:before?.data.createdAt??this.now(),activeVersion:active?version:before?.data.activeVersion??null,pendingVersion:active?null:version,status:active?'active':'draft'};
-    const change=this.journal('tool.updated',[{id,kind:'tool',before,data}]);
+    const change=this.journal('tool.updated',[{id,kind:'tool',before,data}]);if(Object.hasOwn(a,'projectId'))this.setMembership(id,a.projectId??null,actor);
     return{id,version,status:data.status,revision:this.version('nodes',id),...change};
   });}
-  canRemoveCreated(table:string,id:string,deltas:any[]){if(table!=='nodes')return true;if(this.db.prepare("SELECT 1 FROM project_resolutions WHERE project_id=? AND status='resolved' AND COALESCE(change_id,'')!=?").get(id,deltas[0]?.change_id??''))return false;const planned=new Set(deltas.filter((d:any)=>d.table_name==='edges'&&JSON.parse(d.before_json)===null&&this.version('edges',d.object_id)===d.after_revision).map((d:any)=>d.object_id));if(this.all('edges').some((e:any)=>(e.data.from===id||e.data.to===id)&&!planned.has(e.id)))return false;return !this.rows().some((r:any)=>r.data.projectId===id||r.data.taskId===id||(r.data.dependsOn??[]).includes(id));}
   link(from:string,to:string,kind:string,key:string){return this.command(key,{action:'link',from,to,kind},()=>{this.node(from);this.node(to);const old=this.all('edges').find((e:any)=>e.data.from===from&&e.data.to===to&&e.data.kind===kind);if(old)return{id:old.id};const id=randomUUID();return{id,...this.journal('relation.created',[{id,table:'edges',kind:'edge',data:{from,to,kind}}])};});}
-  associateSelected(projectId:string,versions:any[],key:string){return this.command(key,{action:'associate',projectId,versions},()=>{const candidates=new Set(this.findRelated(projectId).map((r:any)=>r.id));const mutations:any[]=[];for(const {id,revision}of versions){if(!candidates.has(id))fail('INAPPLICABLE_MEMORY');if(this.node(id).revision!==revision)fail('STALE_VERSION');if(!this.all('edges').some((e:any)=>e.data.from===projectId&&e.data.to===id&&e.data.kind==='reuses_method'))mutations.push({id:randomUUID(),table:'edges',kind:'edge',data:{from:projectId,to:id,kind:'reuses_method'}});}return{projectId,memoryIds:versions.map(r=>r.id),createdLinks:mutations.length,...mutations.length?this.journal('relation.created',mutations):{}};});}
-  commitPlan(plan:any){const result=super.commitPlan(plan);const bytes=Number(this.db.prepare('SELECT COALESCE(SUM(LENGTH(before_json)+COALESCE(LENGTH(after_json),0)),0) AS n FROM deltas').get().n);if(bytes>this.settings.rollbackMegabytes*1024*1024)fail('ROLLBACK_STORAGE_FULL');return{...result,...result.expiresAt?{expiresDisplay:formattedDeadline(result.expiresAt,this.settings.timezone)}:{}};}
-  pendingSources(limit=40){return this.db.prepare("SELECT s.id,s.session_id,s.role,s.text,s.at,s.project_id,c.workspace,c.preset FROM sources s LEFT JOIN source_context c ON c.id=s.id WHERE status='pending' ORDER BY at LIMIT ?").all(limit);}
-  purge(){super.purgeExpired();const now=this.now(),cutoff=now-this.settings.rawDays*86400000;const removed=this.db.prepare("DELETE FROM sources WHERE at<? AND status IN ('captured','ordinary','temporary') AND id NOT IN (SELECT source_id FROM project_resolutions WHERE status='pending') AND (project_id IS NULL OR project_id NOT IN (SELECT id FROM nodes WHERE kind='project' AND json_extract(data,'$.status')='active'))").run(cutoff).changes;this.db.prepare("DELETE FROM channel_messages WHERE created_at<? AND status IN ('done','sent','unknown')").run(cutoff);
+  associateSelected(projectId:string,versions:any[],key:string){return this.command(key,{action:'associate',projectId,versions},()=>{
+    const candidates=new Set(this.findRelated(projectId).map((row:any)=>row.id));let createdLinks=0;const changeIds:string[]=[];
+    for(const ref of versions){if(!candidates.has(ref.id))fail('INAPPLICABLE_MEMORY');const project=this.tree.node(projectId);const result=this.tree.attach({object:ref,project:{id:projectId,revision:project.revision},role:'applies_to',reason:'复用适用经验',confidence:1},{kind:'system'});if(!result.unchanged)createdLinks++;if(result.changeId)changeIds.push(result.changeId);}
+    return{projectId,memoryIds:versions.map(row=>row.id),createdLinks,changeIds,changeId:changeIds[0]??null};
+  });}
+  commitPlan(plan:any){
+    for(const group of plan.groups){const memberships=new Set(group.members.map((row:any)=>this.tree.membership(row.id)).filter(Boolean));if(memberships.size>1)reject('MEMORY_MEMBERSHIP_CONFLICT');}
+    const result=super.commitPlan(plan);
+    for(const group of plan.groups)for(const duplicate of group.members.slice(1)){
+      this.db.prepare('UPDATE OR IGNORE links SET object_id=? WHERE object_id=?').run(group.members[0].id,duplicate.id);
+      this.db.prepare('DELETE FROM links WHERE object_id=?').run(duplicate.id);
+    }
+    const bytes=Number(this.db.prepare('SELECT COALESCE(SUM(LENGTH(before_json)+COALESCE(LENGTH(after_json),0)),0) AS n FROM deltas').get().n);if(bytes>this.settings.rollbackMegabytes*1024*1024)fail('ROLLBACK_STORAGE_FULL');return{...result,...result.expiresAt?{expiresDisplay:formattedDeadline(result.expiresAt,this.settings.timezone)}:{}};
+  }
+  pendingSources(limit=40){return this.db.prepare("SELECT s.id,s.session_id,s.role,s.text,s.at,c.workspace,c.preset FROM sources s LEFT JOIN source_context c ON c.id=s.id WHERE status='pending' ORDER BY at LIMIT ?").all(limit);}
+  purge(){super.purgeExpired();const now=this.now(),cutoff=now-this.settings.rawDays*86400000;const removed=this.db.prepare("DELETE FROM sources WHERE at<? AND status IN ('captured','ordinary','temporary') AND id NOT IN (SELECT source_id FROM project_resolutions WHERE status IN ('pending','unresolved')) AND id NOT IN (SELECT s.source_id FROM source_projects s JOIN projects p ON p.id=s.project_id WHERE p.status='active')").run(cutoff).changes;this.db.prepare("DELETE FROM channel_messages WHERE created_at<? AND status IN ('done','sent','unknown')").run(cutoff);
     const versionCutoff=now-this.retentionMs;const versions=this.db.prepare('SELECT id,tool_id,created_at FROM tool_versions ORDER BY tool_id,created_at DESC').all();const retained=new Map<string,number>();let purgedVersions=0;for(const v of versions){const tool=this.get('nodes',v.tool_id);const count=retained.get(v.tool_id)??0;retained.set(v.tool_id,count+1);if(v.created_at>=versionCutoff||tool&&(count<3||tool.data.activeVersion===v.id||tool.data.pendingVersion===v.id))continue;purgedVersions+=Number(this.db.prepare('DELETE FROM tool_versions WHERE id=? AND tool_id=?').run(v.id,v.tool_id).changes);}
     const journalCutoff=now-7*86400000;const purgedDeltas=Number(this.db.prepare('DELETE FROM deltas WHERE change_id IN (SELECT id FROM changes WHERE created_at<?)').run(journalCutoff).changes);
     const changeCutoff=now-this.settings.changeSummaryDays*86400000;const purgedChanges=Number(this.db.prepare('DELETE FROM changes WHERE created_at<?').run(changeCutoff).changes);
     this.db.prepare('DELETE FROM deltas WHERE change_id NOT IN (SELECT id FROM changes)').run();
     const purgedSnapshots=this.snapshotPrune().removed;
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');return{purgedSources:removed,purgedVersions,purgedDeltas,purgedChanges,purgedSnapshots};}
-  health(){return{integrity:this.db.prepare('PRAGMA integrity_check').get().integrity_check,foreignKeys:this.db.prepare('PRAGMA foreign_key_check').all(),schemaVersion:1,datasetId:this.owner()};}
+  health(){this.tree.assertIntegrity();return{integrity:this.db.prepare('PRAGMA integrity_check').get().integrity_check,foreignKeys:this.db.prepare('PRAGMA foreign_key_check').all(),schemaVersion:2,datasetId:this.owner()};}
 }

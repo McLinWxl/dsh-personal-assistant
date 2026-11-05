@@ -10,6 +10,8 @@ dist/
 *.key
 .credentials*
 .local/
+.playwright-cli/
+output/
 /RELEASING.md
 *.tgz
 WORKSPACE.md

@@ -1,159 +1,277 @@
 import {randomUUID} from 'node:crypto';
 import {digest, tokens} from './memory-base.mjs';
-import {projectApply, projectDecision} from '../domain/projects.js';
+import {projectApply, projectMaintenancePlan, type ProjectApplication, type ProjectDecision} from '../domain/projects.js';
+import {normalizeProjectName, type ProjectData, type ProjectNode} from '../domain/project-types.js';
+import {schemas, type Actor} from '../domain/contracts.js';
+import {reject} from '../domain/errors.js';
 import type {Store} from './store.js';
 
-const normalized = (value:string) => value.normalize('NFKC').toLowerCase().replace(/[\p{P}\p{Z}\s]/gu, '');
-const conflict = (a:any, b:any) => Object.keys(a).some(k => Object.hasOwn(b, k) && normalized(String(a[k])) !== normalized(String(b[k])));
-function fail(message:string):never {throw new Error(message);}
+interface Source {
+  id: string; session_id: string; role: string; text: string; at: number; status: string;
+}
+interface Resolution {
+  status: string; projectId: string | null; projectIds: string[]; changeIds: string[]; title?: string;
+}
+interface Candidate {
+  id: string; revision: number; title: string; body: string;
+}
+interface PreviewTarget {
+  index: number; project: Partial<ProjectData>; existing: ProjectNode | null;
+  memories: Candidate[]; captured: Candidate[];
+}
 
 export class Projects {
-  constructor(private store:Store) {
-    store.db.exec(`CREATE TABLE IF NOT EXISTS project_resolutions(
-      source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
-      status TEXT NOT NULL DEFAULT 'pending', project_id TEXT, change_id TEXT,
-      result TEXT, previous_project_id TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-      next_at INTEGER NOT NULL DEFAULT 0,last_error TEXT);
-      CREATE INDEX IF NOT EXISTS project_resolution_status ON project_resolutions(status);
-      INSERT OR IGNORE INTO project_resolutions(source_id)
-        SELECT id FROM sources WHERE role='user' AND session_id!='manual'
-        AND session_id NOT IN (SELECT session_id FROM runs WHERE session_id IS NOT NULL);`);
-    const columns=new Set(store.db.prepare('PRAGMA table_info(project_resolutions)').all().map((c:any)=>c.name));
-    for(const [name,type]of Object.entries({attempts:'INTEGER NOT NULL DEFAULT 0',next_at:'INTEGER NOT NULL DEFAULT 0',last_error:'TEXT'}))
-      if(!columns.has(name))store.db.exec(`ALTER TABLE project_resolutions ADD COLUMN ${name} ${type}`);
+  constructor(private readonly store: Store) {}
+
+  enqueue(source: {id: string; role: string; sessionId: string; projectEligible?: boolean}): void {
+    if (source.role !== 'user' || source.sessionId === 'manual') return;
+    const ignored = source.projectEligible === false;
+    this.store.db.prepare('INSERT OR IGNORE INTO project_resolutions(source_id,status,result) VALUES(?,?,?)')
+      .run(source.id, ignored ? 'ignore' : 'pending', ignored ? JSON.stringify({status: 'ignore', projectId: null, projectIds: [], changeIds: []}) : null);
+    if (!ignored) this.store.db.prepare("UPDATE project_resolutions SET next_at=0 WHERE status='unresolved'").run();
   }
-  enqueue(source:any) {
-    if(source.role==='user' && source.sessionId!=='manual') {
-      if(source.projectEligible===false)this.store.db.prepare("INSERT OR IGNORE INTO project_resolutions(source_id,status,result) VALUES(?,'ignore',?)").run(source.id,JSON.stringify({status:'ignore',projectId:null,changeId:null}));
-      else this.store.db.prepare('INSERT OR IGNORE INTO project_resolutions(source_id) VALUES(?)').run(source.id);
-    }
+
+  pending(limit = 20, busy: string[] = []): Source[] {
+    return this.store.db.prepare(`SELECT s.* FROM sources s JOIN project_resolutions p ON p.source_id=s.id
+      WHERE p.status IN ('pending','unresolved') AND p.next_at<=? AND s.status!='buffered'
+      AND s.session_id NOT IN (${busy.map(() => '?').join(',') || "''"}) ORDER BY s.at,s.id LIMIT ?`)
+      .all(this.store.now(), ...busy, limit) as Source[];
   }
-  pending(limit=20,busy:string[]=[]) {
-    return this.store.db.prepare(`SELECT s.*,c.workspace,c.preset FROM sources s
-      JOIN project_resolutions p ON p.source_id=s.id LEFT JOIN source_context c ON c.id=s.id
-      WHERE p.status='pending' AND p.next_at<=? AND s.status!='buffered'
-      AND s.session_id NOT IN (${busy.map(()=>'?').join(',')||"''"}) ORDER BY s.at,s.id LIMIT ?`).all(this.store.now(),...busy,limit);
-  }
-  retry(sourceId:string,error:string) {
-    const row=this.store.db.prepare("SELECT attempts FROM project_resolutions WHERE source_id=? AND status='pending'").get(sourceId);if(!row)return;
-    const attempts=Number(row.attempts)+1,nextAt=this.store.now()+Math.min(3600000,60000*2**Math.min(attempts-1,6));
-    this.store.db.prepare('UPDATE project_resolutions SET attempts=?,next_at=?,last_error=? WHERE source_id=?').run(attempts,nextAt,String(error).slice(0,500),sourceId);
-    this.store.notify('project.failed',{title:'项目识别稍后重试',error:'PROJECT_RETRY_PENDING',sessionId:this.source(sourceId).session_id},'project-failed:'+sourceId);
+
+  retry(sourceId: string, error: string): {nextAt: number} | undefined {
+    const row = this.store.db.prepare("SELECT attempts FROM project_resolutions WHERE source_id=? AND status IN ('pending','unresolved')").get(sourceId);
+    if (!row) return;
+    const attempts = Number(row.attempts) + 1, nextAt = this.store.now() + Math.min(3600000, 60000 * 2 ** Math.min(attempts - 1, 6));
+    this.store.db.prepare('UPDATE project_resolutions SET attempts=?,next_at=?,last_error=? WHERE source_id=?')
+      .run(attempts, nextAt, error.slice(0, 500), sourceId);
+    this.recordDecision('resolution', 'failed', sourceId, this.source(sourceId).text.slice(0, 80), error, {sourceId});
+    this.store.notify('project.failed', {title: '项目识别失败', error, sessionId: this.source(sourceId).session_id}, 'project-failed:' + sourceId);
     return {nextAt};
   }
-  source(id:string) {
-    const source=this.store.db.prepare('SELECT * FROM sources WHERE id=?').get(id);
-    if(!source || source.role!=='user' || source.session_id==='manual') fail('PROJECT_USER_SOURCE_REQUIRED');
+
+  source(id: string): Source {
+    const source = this.store.db.prepare('SELECT * FROM sources WHERE id=?').get(id) as Source | undefined;
+    if (!source || source.role !== 'user' || source.session_id === 'manual') reject('PROJECT_USER_SOURCE_REQUIRED');
     return source;
   }
-  result(sourceId:string) {
-    const row=this.store.db.prepare('SELECT * FROM project_resolutions WHERE source_id=?').get(sourceId);
-    if(!row || row.status==='pending') return null;
-    if(row.status==='undone') return {status:'undone',projectId:row.project_id,changeId:row.change_id};
-    const result=JSON.parse(row.result);
-    if(result.projectId && !this.store.get('nodes',result.projectId)) return {...result,status:'removed'};
+
+  snapshot(): string {
+    return digest({projects: this.store.tree.all(true).map(row => ({id: row.id, revision: row.revision})),
+      bindings: this.store.db.prepare('SELECT session_id,revision FROM session_projects ORDER BY session_id').all()});
+  }
+
+  private evidenceStamp(): string {
+    return digest({catalog: this.snapshot(), sources: this.store.db.prepare("SELECT COUNT(*) AS n,MAX(at) AS at FROM sources WHERE role='user'").get()});
+  }
+
+  result(sourceId: string): Resolution | null {
+    const row = this.store.db.prepare('SELECT * FROM project_resolutions WHERE source_id=?').get(sourceId);
+    if (!row || row.status === 'pending' || row.status === 'unresolved' && row.catalog !== this.evidenceStamp()) return null;
+    const result = JSON.parse(row.result) as Resolution;
+    if (row.status === 'unresolved') this.store.db.prepare('UPDATE project_resolutions SET next_at=? WHERE source_id=?').run(this.store.now() + 86400000, sourceId);
+    const existing = [...new Set(result.projectIds.flatMap(id => {const row=this.store.get('nodes',id);return row?[row.data.mergedInto??id]:[];}))];
+    return digest(existing) === digest(result.projectIds) ? result : {...result, status: existing.length?'reused':'removed', projectIds: existing, projectId: existing.length === 1 ? existing[0] : null};
+  }
+
+  inspect(sourceId: string) {
+    const source = this.source(sourceId), query = new Set(tokens(source.text) as string[]), binding = this.store.tree.binding(source.session_id);
+    const anchor = binding.projectId ? this.store.tree.node(binding.projectId) : null;
+    const expression = [...query].map(term => '"' + term.replaceAll('"', '""') + '"').join(' OR ');
+    const ranks = new Map<string, number>(expression ? this.store.db.prepare('SELECT id,bm25(project_search) AS rank FROM project_search WHERE project_search MATCH ? ORDER BY rank,id')
+      .all(expression).map((row: {id: string; rank: number}) => [row.id, row.rank]) : []);
+    const normalized = normalizeProjectName(source.text);
+    const projects = this.store.tree.all().map(row => ({id: row.id, revision: row.revision, ...row.data,
+      exact: [row.data.key, row.data.path, row.data.title, ...row.data.aliases].some(name => normalizeProjectName(name).length >= 2 && normalized.includes(normalizeProjectName(name))),
+      inAnchor: !!anchor && (row.id === anchor.id || row.data.path.startsWith(anchor.data.path + '/')),
+      rank: ranks.get(row.id) ?? null,
+    })).sort((a, b) => Number(b.exact) - Number(a.exact) || Number(b.inAnchor) - Number(a.inAnchor)
+      || (a.rank ?? Infinity) - (b.rank ?? Infinity) || a.path.localeCompare(b.path)).slice(0, 60);
+    const evidenceSources = (this.store.db.prepare("SELECT s.id,s.text,s.at FROM sources s JOIN project_resolutions p ON p.source_id=s.id WHERE s.role='user' AND p.status!='ignore' ORDER BY s.at DESC LIMIT 300").all() as {id: string; text: string; at: number}[])
+      .filter(item => item.id === source.id || (tokens(item.text) as string[]).filter(term => query.has(term)).length >= 2)
+      .slice(0, 20).map(item => ({...item, text: item.text.slice(0, 10000)}));
+    const background = this.store.db.prepare("SELECT id,text FROM sources WHERE session_id=? AND id!=? AND at<=? AND role='user' ORDER BY at DESC,id DESC LIMIT 3").all(source.session_id, source.id, source.at);
+    return {source, snapshot: this.snapshot(), projects, anchor, binding, evidenceSources, background, result: this.result(sourceId)};
+  }
+
+  private validate(source: Source, decision: ProjectDecision): {project: Partial<ProjectData>; existing: ProjectNode | null} | null {
+    if (!source.text.includes(decision.quote)) reject('QUOTE_NOT_IN_SOURCE');
+    if (decision.action === 'none') return null;
+    if (decision.action === 'attach') {
+      const existing = this.store.tree.node(decision.target.id, decision.target.revision);
+      if (existing.data.status === 'archived') reject('PROJECT_ARCHIVED');
+      return {project: existing.data, existing};
+    }
+    const parent = decision.action === 'create_child' ? decision.parent : null;
+    const input = schemas.projectCreate.parse({...decision.project, parent, evidence: decision.evidence, reason: decision.reason, confidence: decision.confidence});
+    this.store.tree.validateEvidence(input, {kind: 'model', sourceId: source.id, sessionId: source.session_id});
+    if (parent) this.store.tree.node(parent.id, parent.revision);
+    return {project: decision.project, existing: null};
+  }
+
+  preview(raw: unknown): {result?: Resolution; targets: PreviewTarget[]} {
+    const input = projectApply.parse(raw), previous = this.result(input.sourceId);
+    if (previous) return {result: previous, targets: []};
+    const source = this.source(input.sourceId);
+    if (input.snapshot !== this.snapshot()) reject('STALE_PROJECT_CATALOG');
+    const targets: PreviewTarget[] = [];
+    for (const [index, decision] of input.plan.decisions.entries()) {
+      const validated = this.validate(source, decision);
+      if (!validated) continue;
+      const project = validated.project;
+      const memories = this.store.search({query: [project.title, project.statement, ...(project.topics ?? [])].join(' '), purpose: 'personal', limit: 100})
+        .filter((hit: {id: string}) => {
+          const data = this.store.node(hit.id, 'memory').data;
+          return data.reusable && !data.derivedDirty && ['method','fact'].includes(data.type)
+            && Object.entries(data.requirements).every(([key, value]) => digest(project.context?.[key] ?? null) === digest(value))
+            && !data.observations.some((observation: {sourceId: string}) => observation.sourceId === source.id);
+        }).slice(0, 12) as Candidate[];
+      const captured = this.store.rows('memory').filter((row: {data: {observations: {sourceId: string}[]}}) => row.data.observations.some(observation => observation.sourceId === source.id))
+        .slice(0, 30).map((row: {id: string; revision: number; data: {title: string; body: string}}) => ({id: row.id, revision: row.revision, title: row.data.title, body: row.data.body}));
+      targets.push({index, ...validated, memories, captured});
+    }
+    const selected = new Set<string>();
+    for (const selection of input.selections) {
+      const target = targets.find(item => item.index === selection.index);
+      if (!target) reject('PROJECT_SELECTION_INVALID');
+      for (const ref of selection.memories) if (!target.memories.some(item => item.id === ref.id && item.revision === ref.revision)) reject('STALE_OR_INAPPLICABLE_EXPERIENCE');
+      for (const ref of selection.captured) {
+        if (!target.captured.some(item => item.id === ref.id && item.revision === ref.revision)) reject('STALE_OR_UNRELATED_CAPTURE');
+        if (selected.has(ref.id)) reject('PROJECT_MEMBERSHIP_AMBIGUOUS', {id: ref.id});
+        selected.add(ref.id);
+      }
+    }
+    return {targets};
+  }
+
+  apply(raw: unknown): Resolution {
+    const input: ProjectApplication = projectApply.parse(raw), preview = this.preview(input);
+    if (preview.result) return preview.result;
+    const source = this.source(input.sourceId), changeIds: string[] = [], projectIds: string[] = [];
+    let created = false, unresolved = false, deferred = false;
+    for (const [index, decision] of input.plan.decisions.entries()) {
+      if (decision.action === 'none') {
+        unresolved ||= decision.disposition === 'unresolved'; deferred ||= decision.disposition === 'defer';
+        if (decision.disposition === 'unresolved') this.recordDecision('resolution', 'unresolved', source.id, decision.quote.slice(0, 80), decision.reason, decision);
+        continue;
+      }
+      const target = preview.targets.find(item => item.index === index)!;
+      let projectId = target.existing?.id;
+      if (!projectId && decision.action !== 'attach') {
+        const result = this.store.tree.create(schemas.projectCreate.parse({...decision.project, parent: decision.action === 'create_child' ? decision.parent : null,
+          evidence: decision.evidence, reason: decision.reason, confidence: decision.confidence}), {kind: 'model', sourceId: source.id, sessionId: source.session_id});
+        projectId = String(result.id); if (result.changeId) changeIds.push(result.changeId); created = true;
+      }
+      if (!projectId) reject('PROJECT_DECISION_INVALID');
+      projectIds.push(projectId);
+      const selection = input.selections.find(item => item.index === index);
+      for (const [role, refs] of [['applies_to', selection?.memories ?? []], ['contains', selection?.captured ?? []]] as const) {
+        for (const ref of refs) {
+          const result = this.store.tree.attach({object: {id: ref.id, revision: this.store.node(ref.id).revision},
+            project: {id: projectId, revision: this.store.tree.node(projectId).revision}, role,
+            reason: decision.reason, confidence: decision.confidence}, {kind: 'model', sourceId: source.id});
+          if (result.changeId) changeIds.push(result.changeId);
+        }
+      }
+      this.store.db.prepare('INSERT OR IGNORE INTO source_projects VALUES(?,?)').run(source.id, projectId);
+      this.recordDecision('resolution', 'applied', source.id, this.store.tree.node(projectId).data.title, decision.reason, decision, changeIds.at(-1));
+    }
+    const unique = [...new Set(projectIds)];
+    if (unique.length) {
+      const binding = this.store.tree.binding(source.session_id), projectId = unique.length === 1 ? unique[0] : null;
+      const result = this.store.tree.bind({sessionId: source.session_id, project: projectId ? {id: projectId, revision: this.store.tree.node(projectId).revision} : null,
+        expectedRevision: binding.revision, reason: '更新当前会话项目', confidence: 1}, {kind: 'system'});
+      if (result.changeId) changeIds.push(result.changeId);
+    }
+    const result: Resolution = {status: unresolved ? 'unresolved' : deferred ? 'defer' : created ? 'created' : unique.length ? 'reused' : 'ignore',
+      projectId: unique.length === 1 ? unique[0] : null, projectIds: unique, changeIds};
+    if (result.projectId) result.title = this.store.tree.node(result.projectId).data.title;
+    this.store.db.prepare('UPDATE project_resolutions SET status=?,result=?,catalog=?,next_at=?,last_error=NULL WHERE source_id=?')
+      .run(deferred ? 'pending' : result.status === 'created' || result.status === 'reused' ? 'resolved' : result.status,
+        JSON.stringify(result), this.evidenceStamp(), unresolved ? this.store.now() + 86400000 : 0, source.id);
+    this.store.tree.assertIntegrity();
     return result;
   }
-  snapshot() {return digest(this.store.rows('project').map((p:any)=>({id:p.id,revision:p.revision})));}
-  inspect(sourceId:string) {
-    const source=this.source(sourceId),query=new Set(tokens(source.text));
-    const projects=this.store.rows('project').map((p:any)=>{
-      const terms=tokens([p.data.title,p.data.goal,...p.data.topics,...p.data.aliases??[]].join(' '));
-      const score=terms.filter((t:string)=>query.has(t)).length;
-      return {id:p.id,revision:p.revision,...p.data,score};
-    }).sort((a:any,b:any)=>b.score-a.score||b.createdAt-a.createdAt).slice(0,40);
-    const background=this.store.db.prepare("SELECT text,project_id FROM sources WHERE session_id=? AND id!=? AND at<=? AND role='user' ORDER BY at DESC,id DESC LIMIT 3").all(source.session_id,source.id,source.at);
-    return {source,snapshot:this.snapshot(),projects,background,result:this.result(sourceId)};
+
+  recordDecision(phase: string, status: 'unresolved' | 'failed' | 'applied', subjectId: string, title: string, reason: string, plan: unknown, changeId?: string): void {
+    const fingerprint = digest({phase, subjectId, plan}), now = this.store.now();
+    this.store.db.prepare(`INSERT INTO project_decisions VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(fingerprint)
+      DO UPDATE SET status=excluded.status,reason=excluded.reason,change_id=excluded.change_id,updated_at=excluded.updated_at`)
+      .run(randomUUID(), fingerprint, phase, status, subjectId, title, reason, JSON.stringify(plan), changeId ?? null, now, now);
   }
-  validate(sourceId:string, snapshot:string, input:any) {
-    const source=this.source(sourceId),plan=projectDecision.parse(input);
-    if(!source.text.includes(plan.quote)||plan.instanceQuote&&!source.text.includes(plan.instanceQuote)) fail('QUOTE_NOT_IN_SOURCE');
-    if(snapshot!==this.snapshot()) fail('STALE_PROJECT_CATALOG');
-    if(['ignore','review','defer'].includes(plan.decision)) {
-      if(plan.project||plan.match) fail('PROJECT_DECISION_INVALID');
-      return {source,plan,project:null,existing:null};
-    }
-    if(['hypothetical','one-off','unclear'].includes(plan.basis)) fail('PROJECT_COMMITMENT_REQUIRED');
-    if(plan.decision==='reuse') {
-      if(!plan.match||plan.instanceQuote) fail('PROJECT_MATCH_REQUIRED');
-      const existing=this.store.node(plan.match.id,'project');
-      if(existing.revision!==plan.match.revision) fail('STALE_VERSION');
-      if(plan.project&&conflict(plan.project.context,existing.data.context)) fail('PROJECT_CONTEXT_CONFLICT');
-      return {source,plan,project:existing.data,existing};
-    }
-    if(!plan.project||plan.match || !['explicit','committed'].includes(plan.basis)) fail('PROJECT_DECISION_INVALID');
-    const title=normalized(plan.project.title),terms=tokens(plan.project.title);
-    const exact=this.store.rows('project').some((p:any)=>digest(p.data.context)===digest(plan.project!.context)
-      &&([p.data.title,...p.data.aliases??[]].some((name:string)=>normalized(name)===title)
-        || plan.project!.goal.length>=8&&normalized(p.data.goal)===normalized(plan.project!.goal)));
-    if(exact) fail('PROJECT_MATCH_REQUIRES_REVIEW');
-    const similar=this.store.rows('project').filter((p:any)=>{
-      if(conflict(plan.project!.context,p.data.context)) return false;
-      return [p.data.title,...p.data.aliases??[]].some((name:string)=>{
-        if(normalized(name)===title) return true;
-        const other=tokens(name),overlap=other.filter((t:string)=>terms.includes(t)).length;
-        return overlap>=2&&overlap/Math.max(terms.length,other.length)>=0.75;
-      });
+
+  decisions(status?: string, limit = 40, window?: {from: number; to: number}): Record<string, unknown>[] {
+    const query = window
+      ? this.store.db.prepare('SELECT * FROM project_decisions WHERE updated_at>=? AND updated_at<? ORDER BY updated_at,id').all(window.from, window.to)
+      : this.store.db.prepare(`SELECT * FROM project_decisions${status ? ' WHERE status=?' : ''} ORDER BY updated_at DESC,id LIMIT ?`)
+        .all(...status ? [status, limit] : [limit]);
+    return query.map((row: Record<string, unknown>) => ({...row, plan: JSON.parse(String(row.plan))}));
+  }
+
+  maintenanceContext(phase: 'structure' | 'membership', limit: number) {
+    const projects = this.store.tree.all(), now = this.store.now();
+    const offset = Number(this.store.db.prepare('SELECT value FROM settings WHERE key=?').get('project-maintenance-offset:' + phase)?.value ?? 0);
+    const objects = this.store.rows().filter((row: {kind: string}) => ['memory','task','event','tool'].includes(row.kind));
+    const members = projects.map(project => {
+      const own = objects.filter((row: {id: string}) => this.store.tree.membership(row.id) === project.id);
+      const lastActivity = Math.max(project.data.updatedAt, ...own.map((row: {data: {updatedAt?: number; createdAt?: number; observations?: {recordedAt: string}[]}}) =>
+        Math.max(row.data.updatedAt ?? row.data.createdAt ?? 0, ...(row.data.observations ?? []).map(item => Date.parse(item.recordedAt)).filter(Number.isFinite))));
+      return {projectId: project.id, lastActivity, idleDays: Math.floor((now - lastActivity) / 86400000),
+        objects: own.slice(0, 100).map((row: {id: string; revision: number; kind: string; data: Record<string, unknown>}) => ({id: row.id, revision: row.revision, kind: row.kind, data: row.data})),
+        totalObjects: own.length};
     });
-    // Similarity suggests a review; it never silently merges distinct projects.
-    if(similar.length) fail('PROJECT_MATCH_REQUIRES_REVIEW');
-    return {source,plan,project:plan.project,existing:null};
+    return {phase, snapshot: this.snapshot(), projects, members,
+      objects: phase === 'membership' ? objects.slice(offset, offset + limit) : [],
+      offset, totalObjects: objects.length,
+      recentChanges: this.store.tree.history(now - 7 * 86400000, now + 1).slice(-60),
+      unresolved: this.decisions('unresolved', 20)};
   }
-  preview(input:any) {
-    const a=projectApply.parse(input),previous=this.result(a.sourceId);
-    if(previous) return {result:previous};
-    const resolved=this.validate(a.sourceId,a.snapshot,a.plan);
-    if(!resolved.project) return {...resolved,memories:[],captured:[]};
-    const p=resolved.project,query=[p.title,p.goal,...p.topics].join(' ');
-    const memories=this.store.search({query,purpose:'personal',limit:100}).filter((hit:any)=>{
-      const row=this.store.node(hit.id,'memory'),d=row.data;
-      return d.reusable&&!d.derivedDirty&&['method','fact'].includes(d.type)
-        &&Object.entries(d.requirements).every(([k,v])=>JSON.stringify(p.context[k])===JSON.stringify(v))
-        &&!d.observations.some((o:any)=>o.sourceId===a.sourceId);
-    }).slice(0,12);
-    const captured=this.store.rows('memory').filter((m:any)=>m.data.observations.some((o:any)=>o.sourceId===a.sourceId))
-      .slice(0,30).map((m:any)=>({id:m.id,revision:m.revision,title:m.data.title,body:m.data.body}));
-    return {...resolved,memories,captured};
+
+  maintenanceApply(raw: unknown, phase: 'structure' | 'membership', snapshot: string, requestId: string) {
+    const plan = projectMaintenancePlan.parse(raw);
+    return this.store.command(requestId + ':batch', {phase, snapshot, plan}, () => this.applyMaintenance(plan, phase, snapshot, requestId));
   }
-  apply(input:any) {
-    const a=projectApply.parse(input),previous=this.result(a.sourceId);
-    if(previous) return previous;
-    const preview=this.preview(a);if('result' in preview)return preview.result;
-    const {source,plan,project,existing,memories,captured}=preview;
-    const selected=new Map(memories.map((m:any)=>[m.id,m]));
-    for(const ref of a.memories){const candidate:any=selected.get(ref.id);if(!candidate||candidate.revision!==ref.revision) fail('STALE_OR_INAPPLICABLE_EXPERIENCE');}
-    for(const ref of a.captured)if(!captured.some((m:any)=>m.id===ref.id&&m.revision===ref.revision))fail('STALE_OR_UNRELATED_CAPTURE');
-    if(!project) {
-      const result={status:plan.decision,projectId:null,changeId:null};
-      if(plan.decision==='defer')return result;
-      this.store.db.prepare('UPDATE project_resolutions SET status=?,result=? WHERE source_id=?').run(plan.decision,JSON.stringify(result),a.sourceId);
-      if(plan.decision==='review') this.store.notify('project.review-needed',{title:source.text.slice(0,80),sessionId:source.session_id},'project-review:'+a.sourceId);
-      return result;
-    }
-    const projectId=existing?.id??randomUUID(),mutations:any[]=[];
-    if(!existing) mutations.push({id:projectId,kind:'project',data:{...project,aliases:[],owner:this.store.owner(),createdAt:this.store.now()}});
-    else if(plan.project&&normalized(plan.project.title)!==normalized(existing.data.title)&&!(existing.data.aliases??[]).includes(plan.project.title)) {
-      mutations.push({id:projectId,before:existing,data:{...existing.data,aliases:[...existing.data.aliases??[],plan.project.title].slice(-30)}});
-    }
-    const edges=this.store.all('edges'),add=(memoryId:string,kind:string)=>{
-      if(!edges.some((e:any)=>e.data.from===projectId&&e.data.to===memoryId&&e.data.kind===kind)&&!mutations.some(m=>m.table==='edges'&&m.data.to===memoryId&&m.data.kind===kind))
-        mutations.push({id:randomUUID(),table:'edges',kind:'edge',data:{from:projectId,to:memoryId,kind}});
+
+  private applyMaintenance(plan: ReturnType<typeof projectMaintenancePlan.parse>, phase: 'structure' | 'membership', snapshot: string, requestId: string) {
+    if (snapshot !== this.snapshot()) reject('STALE_PROJECT_CATALOG');
+    const originalVersions = new Map<string, number>(this.store.rows().map((row: {id: string; revision: number}) => [row.id, row.revision]));
+    // The worker runs this batch serially. Accept version changes caused by
+    // earlier operations in this plan, but never rebase an already stale input.
+    const rebase = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(rebase);
+      if (!value || typeof value !== 'object') return value;
+      const row = value as Record<string, unknown>;
+      if (typeof row.id === 'string' && typeof row.revision === 'number') {
+        if (originalVersions.get(row.id) !== row.revision) reject('STALE_VERSION', {id: row.id});
+        return {...Object.fromEntries(Object.entries(row).map(([key, item]) => [key, rebase(item)])), revision: this.store.node(row.id).revision};
+      }
+      return Object.fromEntries(Object.entries(row).map(([key, item]) => [key, rebase(item)]));
     };
-    for(const ref of a.memories) add(ref.id,'reuses_method');
-    for(const ref of a.captured)add(ref.id,'belongs_to');
-    const change=mutations.length?this.store.journal(existing?'project.recognized':'project.created',mutations):{changeId:null};
-    const result={status:existing?'reused':'created',projectId,title:project.title,linkedMemories:a.memories.length,...change};
-    this.store.db.prepare('UPDATE project_resolutions SET status=?,project_id=?,change_id=?,result=?,previous_project_id=? WHERE source_id=?')
-      .run('resolved',projectId,change.changeId,JSON.stringify(result),source.project_id,a.sourceId);
-    this.store.db.prepare('UPDATE sources SET project_id=? WHERE id=?').run(projectId,a.sourceId);
-    if(change.changeId){this.store.db.prepare('UPDATE notifications SET payload=? WHERE id=?').run(JSON.stringify(result),change.changeId);
-      this.store.db.prepare('UPDATE outbox SET payload=? WHERE id=?').run(JSON.stringify(result),change.changeId);}
-    return result;
-  }
-  undo(changeId:string) {
-    for(const row of this.store.db.prepare('SELECT * FROM project_resolutions WHERE change_id=?').all(changeId)) {
-      this.store.db.prepare('UPDATE sources SET project_id=? WHERE id=? AND project_id=?').run(row.previous_project_id,row.source_id,row.project_id);
+    const results: unknown[] = [];
+    for (const [index, operation] of plan.operations.entries()) {
+      if (phase === 'membership' && !['projectAttach','projectDetach'].includes(operation.command)) reject('MAINTENANCE_COMMAND_NOT_ALLOWED');
+      const payload = operation.payload, subject = String(payload.id ?? (payload.source as {id?: string})?.id ?? (payload.object as {id?: string})?.id ?? '');
+      try {
+        const recent=this.store.db.prepare("SELECT created_at FROM project_changes WHERE object_id=? AND action IN ('moved','merged','split','archived','attached','detached') ORDER BY created_at DESC LIMIT 1").get(subject);
+        if(recent&&Number(recent.created_at)>this.store.now()-7*86400000){
+          const latest=this.store.db.prepare('SELECT MAX(s.at) AS at FROM source_projects sp JOIN sources s ON s.id=sp.source_id WHERE sp.project_id=?').get(subject);
+          const object=this.store.get('nodes',subject);
+          const activity=Math.max(Number(latest?.at??0),Number(object?.data.updatedAt??0));
+          if(activity<=Number(recent.created_at))reject('PROJECT_RECENTLY_ORGANIZED');
+        }
+        if (operation.command === 'projectArchive') {
+          const context = this.maintenanceContext('structure', 1), member = context.members.find(item => item.projectId === subject);
+          if (!member || member.idleDays < 90) reject('PROJECT_STILL_ACTIVE');
+        }
+        const result = this.store.dispatch(operation.command, rebase(payload), requestId + ':' + index, {kind: 'maintenance'}) as {changeId?: string};
+        this.recordDecision(phase, 'applied', subject, this.store.get('nodes', subject)?.data.title ?? subject, String(payload.reason ?? ''), operation, result.changeId);
+        results.push({command: operation.command, status: 'applied', ...result});
+      } catch (error) {
+        const failure = error as Error & {code?: string; details?: unknown};
+        this.recordDecision(phase, 'failed', subject, this.store.get('nodes', subject)?.data.title ?? subject, failure.message, operation);
+        results.push({command: operation.command, status: 'failed', error: {code: failure.code ?? failure.message, details: failure.details ?? null}});
+      }
     }
-    this.store.db.prepare("UPDATE project_resolutions SET status='undone' WHERE change_id=?").run(changeId);
+    for (const item of plan.unresolved) this.recordDecision(phase, 'unresolved', item.subjectId, item.title, item.reason, item);
+    return {results};
   }
 }

@@ -51,7 +51,7 @@ export async function apply(ctx:PluginContext,config:PluginConfig){
   const text=await request.text();if(text.length>2500000)return new Response(null,{status:413});let message;
   try{message=JSON.parse(text);}catch{return new Response(null,{status:400});}
   if(message?.type!=='client-request'||message.method!==endpoint||typeof message.rpcId!=='string'||typeof message.payload?.method!=='string')return new Response(null,{status:400});
-  let result;try{result={ok:true,value:await handler(message.payload.method,message.payload.payload??{})};}catch(e:any){result={ok:false,error:{code:e.code??'assistant/operation-failed',message:e.message,details:e.issues??{}}};}
+  let result;try{result={ok:true,value:await handler(message.payload.method,message.payload.payload??{})};}catch(e:any){result={ok:false,error:{code:e.code??'assistant/operation-failed',message:e.message,details:e.details??e.issues??{}}};}
   return Response.json({type:'server-response',rpcId:message.rpcId,result});
  }});
  ctx.effect(()=>async()=>{off();await weixin.stop();await scheduler.stop();await service.close();},'personal-assistant.dispose');

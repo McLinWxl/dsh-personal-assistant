@@ -23,9 +23,25 @@ export const defaults = { timezone: 'Asia/Shanghai', retentionHours: 72, rawDays
   model: '', basePreset: 'default', workspace: '' };
 export type Settings = z.infer<typeof settingsSchema>;
 
-export const projectSchema = z.strictObject({ title: text, goal: z.string().max(10000).default(''),
+export const projectSchema = z.strictObject({ title: text, statement: z.string().max(10000).default(''),
   domains: labels.default([]), topics: labels.default([]), context: context.default({}),
   status: z.enum(['active', 'paused', 'completed', 'archived']).default('active') });
+export const projectKey = z.string().min(1).max(100).regex(/^[a-z0-9][a-z0-9_-]*$/);
+export const projectEvidence = z.strictObject({
+  basis: z.enum(['explicit', 'sustained']),
+  sources: z.array(z.strictObject({ sourceId: id, quote: text })).min(1).max(10),
+});
+export const projectReason = {
+  reason: z.string().max(2000).default(''),
+  confidence: z.number().min(0).max(1).default(1),
+};
+export const projectOperations = ['projectCreate', 'projectEdit', 'projectRename', 'projectMove',
+  'projectMerge', 'projectSplit', 'projectArchive', 'projectRestore', 'projectRemove',
+  'projectAttach', 'projectDetach', 'projectAlias', 'projectBind'] as const;
+export const projectCreateSchema = projectSchema.extend({
+  key: projectKey.optional(), parent: version.nullable().default(null),
+  evidence: projectEvidence.optional(), ...projectReason,
+});
 export const memorySchema = z.strictObject({ title: text, body: text, notes:z.string().max(10000).default(''),
   type: z.enum(['fact','method','episode','preference','decision','goal']),
   facts: z.array(fact).min(1).max(40),
@@ -62,7 +78,28 @@ export const schemas = {
   overview: z.strictObject({}), list: z.strictObject({ kind: z.enum(['memory','project','task','event','tool','entity']), query: z.string().max(500).default(''), projectId: id.optional(), offset: z.number().int().nonnegative().default(0), limit: z.number().int().min(1).max(100).default(40), sort: z.enum(['updated','created','title']).default('updated') }),
   searchAll: z.strictObject({ query: z.string().min(1).max(500), limit: z.number().int().min(1).max(50).default(20) }),
   get: z.strictObject({ id }), relations:z.strictObject({id}), settingsGet: z.strictObject({}), settingsSave: patchSchema(settingsSchema),
-  projectCreate: projectSchema, projectEdit: z.strictObject({ id, revision: z.number().int(), patch: patchSchema(projectSchema) }),
+  projectCreate: projectCreateSchema,
+  projectEdit: version.extend({ patch: patchSchema(projectSchema), ...projectReason }),
+  projectTree: z.strictObject({ rootId: id.optional(), includeArchived: z.boolean().default(true) }),
+  projectRename: version.extend({ title: text, ...projectReason }),
+  projectMove: version.extend({ parent: version.nullable(), ...projectReason }),
+  projectMerge: z.strictObject({ source: version, target: version, ...projectReason }),
+  projectSplit: version.extend({
+    parts: z.array(z.strictObject({
+      project: projectSchema, key: projectKey.optional(),
+      objects: z.array(version).max(500).default([]),
+      children: z.array(version).max(100).default([]),
+    })).min(2).max(20), ...projectReason,
+  }),
+  projectArchive: version.extend({ ...projectReason }),
+  projectRestore: version.extend({ status: z.enum(['active','paused','completed']).default('active'), ...projectReason }),
+  projectAttach: z.strictObject({ object: version, project: version, role: z.enum(['contains','applies_to']).default('contains'), ...projectReason }),
+  projectDetach: z.strictObject({ object: version, project: version, role: z.enum(['contains','applies_to']).default('contains'), ...projectReason }),
+  projectAlias: version.extend({ alias: text, action: z.enum(['add','remove']), ...projectReason }),
+  projectBind: z.strictObject({ sessionId: id.optional(), project: version.nullable(), expectedRevision: z.number().int().nonnegative(), ...projectReason }),
+  projectBinding: z.strictObject({ sessionId: id.optional() }),
+  projectPreview: z.strictObject({ operation: z.enum(projectOperations), payload: z.record(z.string(), z.json()) }),
+  projectDecisions: z.strictObject({ status: z.enum(['unresolved','failed','applied']).optional(), limit: z.number().int().min(1).max(100).default(40) }),
   memoryCapture: memorySchema,
   memoryRefresh:z.strictObject({id,revision:z.number().int(),facts:z.array(fact).min(1).max(40),domains:labels,topics:labels}),
   memoryClassify:z.strictObject({id,revision:z.number().int(),domains:labels,topics:labels,reusable:z.boolean().optional()}),
@@ -82,17 +119,22 @@ export const schemas = {
   snapshotPrune: z.strictObject({ days: z.number().int().min(1).max(90).optional() }),
   remove: z.strictObject({ id, revision:z.number().int() }),
   memoryRemove:z.strictObject({id,revision:z.number().int()}),
-  projectRemove:z.strictObject({id,revision:z.number().int()}),
+  projectRemove:version.extend({ ...projectReason }),
   taskCreate:taskSchema, taskEdit:z.strictObject({id,revision:z.number().int(),patch:patchSchema(taskSchema)}),
   eventOverride:z.strictObject({id,revision:z.number().int(),occurrence:z.string().min(10).max(45),cancelled:z.boolean().default(false),patch:patchSchema(eventSchema).default({})}),
   eventCreate:eventSchema, eventEdit:z.strictObject({id,revision:z.number().int(),patch:patchSchema(eventSchema)}),
   calendar:z.strictObject({from:timestamp,to:timestamp}), icsImport:z.strictObject({content:z.string().min(1).max(2000000),timezone:settingsSchema.shape.timezone}), icsExport:z.strictObject({ids:z.array(id).max(500).optional()}),
   inbox:z.strictObject({offset:z.number().int().nonnegative().default(0)}), inboxRead:z.strictObject({id}),
-  toolSave: z.strictObject({id:id.optional(),revision:z.number().int().optional(),definition:workflowSchema}),
+  toolSave: z.strictObject({id:id.optional(),revision:z.number().int().optional(),projectId:id.nullable().optional(),definition:workflowSchema}),
   toolActivate:z.strictObject({id,revision:z.number().int(),version:id}), toolVersions:z.strictObject({id}),
   sourceReview:z.strictObject({sourceId:id,reason:z.enum(['captured','ordinary','temporary'])}),
   entitySave:z.strictObject({id:id.optional(),revision:z.number().int().optional(),name:text,type:z.enum(['person','place','organization','item','topic']),aliases:labels.default([]),domains:labels.default([])}),
-  link:z.strictObject({from:id,to:id,kind:z.enum(['about','belongs_to','reuses_method','related_to'])}),
+  link:z.strictObject({from:id,to:id,kind:z.enum(['about','related_to'])}),
+  capabilityGapReport: z.strictObject({ kind: z.enum(['unavailable','prerequisite','reported']), target: id, context: text, code: id.optional() }),
+  capabilityGaps: z.strictObject({ status: z.enum(['open','planned','resolved','dismissed']).optional(), limit: z.number().int().min(1).max(100).default(40) }),
+  capabilityGapUpdate: z.strictObject({ id, revision: z.number().int().positive(), status: z.enum(['planned','resolved','dismissed']), resolution: text, toolId: id.optional() }),
+  capabilityProposal: z.strictObject({ gapIds: z.array(id).min(1).max(30), kind: z.enum(['registration','workflow','implementation']), title: text, plan: text, toolId: id.optional() }),
+  capabilityCatalog: z.strictObject({}),
 };
 export type Command = keyof typeof schemas;
 export type Actor = { kind:'ui'|'model'|'maintenance'|'system'; sourceId?:string; sessionId?:string; allowedSourceIds?:string[] };

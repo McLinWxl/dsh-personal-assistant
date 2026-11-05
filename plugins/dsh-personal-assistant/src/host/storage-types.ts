@@ -61,7 +61,7 @@ export interface MemoryHit extends StoredRecord<{title:string;body:string;facts:
  observations?:unknown[];
 }
 
-export interface ProjectRef {id:string;revision:number;title:string;goal:string;context:Record<string,unknown>;status:string}
+export interface ProjectRef {id:string;revision:number;title:string;statement:string;context:Record<string,unknown>;status:string}
 
 export interface ConversationRow {session_id:string;id?:string;title?:string}
 
@@ -107,6 +107,7 @@ export interface ChangeDetails {
 }
 
 export interface ReportItem {
+ metadata?:Record<string,unknown>;
  kind:'memory'|'project'|'task'|'event'|'tool'|'run'|'wechat'|'maintenance'|string;
  objectId:string|null;
  action:string;
@@ -156,10 +157,12 @@ export interface SnapshotRecord {id:string;path:string;bytes:number;sha256:strin
 export interface HealthReport {integrity:string}
 
 export interface ProjectContext {
- result:ProjectRef|null;
+ result:unknown;
  projects:ProjectRef[];
  source:{id:string;text:string};
- snapshot:unknown;
+ snapshot:string;
+ anchor:unknown;
+ binding:{sessionId:string;projectId:string|null;revision:number};
 }
 
 export interface StorageMethods {
@@ -206,8 +209,8 @@ export interface StorageMethods {
  toolReview:{args:Record<string,unknown>;result:ToolReviewRow[]};
  workflowResult:{args:{sessionId:string;toolId:string;version:string};result:{outcome:string}|null};
  projectInspect:{args:{sourceId:string};result:ProjectContext};
- projectApply:{args:{sourceId:string;snapshot:unknown;plan:unknown;memories:unknown[];captured?:unknown[];requestId:string};result:ProjectRef|null};
- projectPreview:{args:{sourceId:string;snapshot:unknown;plan:unknown;memories:unknown[]};result:{result:ProjectRef|null;project:ProjectRef;memories:unknown[];captured:unknown[]}};
+ projectApply:{args:{sourceId:string;snapshot:unknown;plan:unknown;selections:unknown[];requestId:string};result:unknown};
+ projectPreview:{args:{sourceId:string;snapshot:unknown;plan:unknown;selections:unknown[]};result:{result?:unknown;targets:{index:number;project:unknown;memories:unknown[];captured:unknown[]}[]}};
  projectPending:{args:{limit:number;busy:string[]};result:PendingSource[]};
  projectRetry:{args:{sourceId:string;error:string};result:unknown};
  export:{args:{destination:string};result:unknown};
