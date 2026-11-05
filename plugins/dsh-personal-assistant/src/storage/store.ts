@@ -146,6 +146,7 @@ export class Store extends Base {
       case'snapshotTake':return this.snapshotTake();
       case'snapshotPrune':return this.snapshotPrune(a.days);
       case'remove':return this.remove(a.id,a.revision,key);
+      case'projectRemove':{this.node(a.id,'project');return this.remove(a.id,a.revision,key);}
       case'memoryRemove':if(actor.kind==='maintenance')fail('MAINTENANCE_COMMAND_NOT_ALLOWED');this.node(a.id,'memory');return this.remove(a.id,a.revision,key);
       case'taskCreate':this.taskReferences(a);return this.create('task',this.taskData(a),key);
       case'taskEdit':{const row=this.node(a.id,'task');this.taskReferences({...row.data,...a.patch},a.id);if(actor.kind==='model'&&a.patch.status==='completed')fail('TASK_COMPLETION_REQUIRES_RUN_RESULT');return this.edit(a.id,'task',this.taskData({...row.data,...a.patch}),a.revision,key);}

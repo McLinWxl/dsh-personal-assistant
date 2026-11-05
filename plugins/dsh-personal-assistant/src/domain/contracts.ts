@@ -82,6 +82,7 @@ export const schemas = {
   snapshotPrune: z.strictObject({ days: z.number().int().min(1).max(90).optional() }),
   remove: z.strictObject({ id, revision:z.number().int() }),
   memoryRemove:z.strictObject({id,revision:z.number().int()}),
+  projectRemove:z.strictObject({id,revision:z.number().int()}),
   taskCreate:taskSchema, taskEdit:z.strictObject({id,revision:z.number().int(),patch:patchSchema(taskSchema)}),
   eventOverride:z.strictObject({id,revision:z.number().int(),occurrence:z.string().min(10).max(45),cancelled:z.boolean().default(false),patch:patchSchema(eventSchema).default({})}),
   eventCreate:eventSchema, eventEdit:z.strictObject({id,revision:z.number().int(),patch:patchSchema(eventSchema)}),
